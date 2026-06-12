@@ -14,6 +14,7 @@ public struct ParsedMessage: Sendable {
     public var date: Date             // falls back to fileMTime if header was missing/garbled
     public var plainBody: String?
     public var htmlBody: String?
+    public var attachments: [AttachmentIn]
     public var sizeBytes: Int64
 }
 
@@ -42,9 +43,9 @@ public enum RFC5322Parser {
 
         let date = parseDate(headers["date"]) ?? fallbackDate
 
-        // Body decoding: this first cut treats the entire body as plain text.
-        // MIME multipart parsing comes in Phase 2E.
-        let plain = decodeBodyAsText(bodyBytes)
+        // MIME-aware body decoding: handles multipart/alternative, multipart/mixed,
+        // base64 / quoted-printable encoded bodies, and extracts attachments.
+        let mime = MIMEParser.parse(headers: headers, body: bodyBytes)
 
         return ParsedMessage(
             messageID: messageID,
@@ -55,8 +56,9 @@ public enum RFC5322Parser {
             toAddresses: to,
             ccAddresses: cc,
             date: date,
-            plainBody: plain,
-            htmlBody: nil,
+            plainBody: mime.plainBody,
+            htmlBody: mime.htmlBody,
+            attachments: mime.attachments,
             sizeBytes: Int64(raw.count)
         )
     }
@@ -221,6 +223,42 @@ public enum RFC5322Parser {
         return String(data: d, encoding: cf) ?? String(data: d, encoding: .isoLatin1)
     }
 
+    static func decodeQuotedPrintableString(_ s: String) -> Data? {
+        decodeQuotedPrintable(s)
+    }
+
+    /// Decode quoted-printable raw bytes (preserves CRLF semantics for bodies).
+    static func decodeQuotedPrintableData(_ data: Data) -> Data {
+        var out = Data()
+        out.reserveCapacity(data.count)
+        let bs = data.startIndex
+        let n = data.count
+        var i = 0
+        while i < n {
+            let b = data[bs + i]
+            if b == 0x3D && i + 2 < n {  // '='
+                let h1 = data[bs + i + 1], h2 = data[bs + i + 2]
+                if h1 == 0x0D && h2 == 0x0A {
+                    i += 3; continue   // soft line break
+                }
+                if h1 == 0x0A {        // bare \n soft break (non-conforming but seen)
+                    i += 2; continue
+                }
+                if let hi = hexNibble(h1), let lo = hexNibble(h2) {
+                    out.append(UInt8(hi << 4 | lo))
+                    i += 3; continue
+                }
+            }
+            out.append(b)
+            i += 1
+        }
+        return out
+    }
+
+    static func charsetEncoding(_ charset: String) -> String.Encoding {
+        stringEncoding(forCharset: charset.lowercased())
+    }
+
     private static func decodeQuotedPrintable(_ s: String) -> Data? {
         var out = Data()
         let bytes = Array(s.utf8)
@@ -293,15 +331,6 @@ public enum RFC5322Parser {
         "EEE, d MMM yyyy HH:mm Z",
         "yyyy-MM-dd'T'HH:mm:ssZ",
     ]
-
-    // MARK: - Body decoding
-
-    private static func decodeBodyAsText(_ body: Data) -> String? {
-        if body.isEmpty { return nil }
-        if let s = String(data: body, encoding: .utf8) { return s }
-        if let s = String(data: body, encoding: .isoLatin1) { return s }
-        return nil
-    }
 
     private static func hash(_ data: Data) -> String {
         var h: UInt64 = 0xcbf29ce484222325

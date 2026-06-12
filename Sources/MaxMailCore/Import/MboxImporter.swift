@@ -74,9 +74,10 @@ public final class MboxImporter: @unchecked Sendable {
                 ccAddresses: parsed.ccAddresses,
                 date: parsed.date,
                 sizeBytes: parsed.sizeBytes,
+                flags: parsed.attachments.isEmpty ? [] : .hasAttachment,
                 plainBody: parsed.plainBody,
                 htmlBody: parsed.htmlBody,
-                attachments: []   // Phase 2E: MIME multipart + attachments
+                attachments: parsed.attachments
             ))
 
             if batch.count >= self.options.batchSize {
