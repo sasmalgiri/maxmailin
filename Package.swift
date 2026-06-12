@@ -10,6 +10,7 @@ let package = Package(
     ],
     products: [
         .library(name: "MaxMailCore", targets: ["MaxMailCore"]),
+        .executable(name: "maxmail-stress", targets: ["MaxMailStress"]),
     ],
     targets: [
         .target(
@@ -17,6 +18,10 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]
+        ),
+        .executableTarget(
+            name: "MaxMailStress",
+            dependencies: ["MaxMailCore"]
         ),
         .testTarget(
             name: "MaxMailCoreTests",

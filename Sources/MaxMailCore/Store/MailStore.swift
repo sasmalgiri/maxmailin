@@ -234,6 +234,116 @@ public actor MailStore {
         }
     }
 
+    /// Bulk-ingest a batch of messages under one transaction with reused
+    /// prepared statements. The throughput-critical path for both initial
+    /// archive import and live-sync delta application.
+    ///
+    /// Returns the number of new rows actually inserted (duplicates skipped).
+    @discardableResult
+    public func bulkIngest(_ messages: [IngestMessage]) throws -> Int {
+        guard !messages.isEmpty else { return 0 }
+
+        // Prepare every statement once.
+        let selExisting = try conn.prepare("SELECT id FROM messages WHERE account_id = ? AND message_id = ?;")
+        let insMsg = try conn.prepare("""
+        INSERT INTO messages(
+            account_id, folder_id, message_id, in_reply_to, references_,
+            subject, from_addr, to_addrs, cc_addrs,
+            date_unix, size_bytes, flags, snippet, has_body
+        ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?)
+        RETURNING id;
+        """)
+        let insBody = try conn.prepare("INSERT INTO message_bodies(message_id, plain_body, html_body) VALUES(?, ?, ?);")
+        let insAtt = try conn.prepare("INSERT INTO attachments(message_id, filename, sha256) VALUES(?, ?, NULL);")
+        let insFTS = try conn.prepare("INSERT INTO messages_fts(rowid, subject, from_addr, to_addrs, body) VALUES(?, ?, ?, ?, ?);")
+        let selFolderID = try conn.prepare("SELECT id FROM folders WHERE account_id = ? AND path = ?;")
+        let insFolder = try conn.prepare("INSERT INTO folders(account_id, path) VALUES(?, ?) RETURNING id;")
+
+        // Cache folder IDs in the loop so repeats are free.
+        var folderCache: [Int64: [String: Int64]] = [:]
+        var inserted = 0
+
+        try conn.transaction {
+            for m in messages {
+                // folder id (cached per account+path)
+                let fid: Int64
+                if let cached = folderCache[m.accountID]?[m.folder] {
+                    fid = cached
+                } else {
+                    selFolderID.reset()
+                    try selFolderID.bind(1, m.accountID)
+                    try selFolderID.bind(2, m.folder)
+                    var found: Int64 = 0
+                    try selFolderID.forEachRow { row in found = row.int64(0); return false }
+                    if found == 0 {
+                        insFolder.reset()
+                        try insFolder.bind(1, m.accountID)
+                        try insFolder.bind(2, m.folder)
+                        try insFolder.forEachRow { row in found = row.int64(0); return false }
+                    }
+                    folderCache[m.accountID, default: [:]][m.folder] = found
+                    fid = found
+                }
+
+                // duplicate check
+                selExisting.reset()
+                try selExisting.bind(1, m.accountID)
+                try selExisting.bind(2, m.messageID)
+                var existing: Int64 = 0
+                try selExisting.forEachRow { row in existing = row.int64(0); return false }
+                if existing != 0 { continue }
+
+                // insert message
+                let snippet = makeSnippet(plain: m.plainBody, html: m.htmlBody)
+                let hasBody: Int64 = (m.plainBody != nil || m.htmlBody != nil) ? 1 : 0
+
+                insMsg.reset()
+                try insMsg.bind(1, m.accountID)
+                try insMsg.bind(2, fid)
+                try insMsg.bind(3, m.messageID)
+                try insMsg.bind(4, m.inReplyTo)
+                try insMsg.bind(5, m.references.isEmpty ? nil : m.references.joined(separator: " "))
+                try insMsg.bind(6, m.subject)
+                try insMsg.bind(7, m.fromAddress)
+                try insMsg.bind(8, m.toAddresses.joined(separator: ", "))
+                try insMsg.bind(9, m.ccAddresses.joined(separator: ", "))
+                try insMsg.bind(10, Int64(m.date.timeIntervalSince1970))
+                try insMsg.bind(11, m.sizeBytes)
+                try insMsg.bind(12, Int64(m.flags.rawValue))
+                try insMsg.bind(13, snippet)
+                try insMsg.bind(14, hasBody)
+                var newID: Int64 = 0
+                try insMsg.forEachRow { row in newID = row.int64(0); return false }
+
+                if hasBody == 1 {
+                    insBody.reset()
+                    try insBody.bind(1, newID)
+                    try insBody.bind(2, m.plainBody)
+                    try insBody.bind(3, m.htmlBody)
+                    try insBody.run()
+                }
+
+                for name in m.attachmentNames {
+                    insAtt.reset()
+                    try insAtt.bind(1, newID)
+                    try insAtt.bind(2, name)
+                    try insAtt.run()
+                }
+
+                insFTS.reset()
+                try insFTS.bind(1, newID)
+                try insFTS.bind(2, m.subject)
+                try insFTS.bind(3, m.fromAddress)
+                try insFTS.bind(4, m.toAddresses.joined(separator: " "))
+                try insFTS.bind(5, m.plainBody ?? "")
+                try insFTS.run()
+
+                inserted += 1
+            }
+        }
+        return inserted
+    }
+
     // MARK: - Reads (paged, never load everything)
 
     /// Page through a folder, newest-first. `before` is the unix date of the last

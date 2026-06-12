@@ -130,7 +130,10 @@ public final class SQLiteStatement {
     }
 
     /// Iterate rows. Body returns `true` to keep going, `false` to stop.
+    /// The statement is reset on every exit path so the cursor never stays
+    /// "in progress" — otherwise SQLite refuses to COMMIT an enclosing txn.
     public func forEachRow(_ body: (SQLiteRow) throws -> Bool) throws {
+        defer { sqlite3_reset(stmt) }
         while true {
             let rc = sqlite3_step(stmt)
             if rc == SQLITE_ROW {
