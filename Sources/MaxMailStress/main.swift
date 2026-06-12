@@ -10,6 +10,7 @@ struct StressOptions {
     var count: Int = 100_000
     var batchSize: Int = 5_000
     var searchQueries: Int = 25
+    var sinceDays: Int? = nil
     var keepDB: Bool = false
     var dbPath: String?
 
@@ -28,6 +29,9 @@ struct StressOptions {
             case "-q", "--queries":
                 i += 1
                 opts.searchQueries = Int(args[i]) ?? opts.searchQueries
+            case "--since-days":
+                i += 1
+                opts.sinceDays = Int(args[i])
             case "--keep":
                 opts.keepDB = true
             case "--db":
@@ -49,13 +53,14 @@ struct StressOptions {
 let usage = """
 maxmail-stress — synthetic 1 TB-trajectory scale test for MaxMailCore
 
-Usage: maxmail-stress [-n COUNT] [-b BATCH] [-q QUERIES] [--keep] [--db PATH]
+Usage: maxmail-stress [-n COUNT] [-b BATCH] [-q QUERIES] [--since-days N] [--keep] [--db PATH]
 
-  -n, --count    N    Total messages to ingest (default 100000)
-  -b, --batch    N    Messages per transaction (default 5000)
-  -q, --queries  N    Number of random search queries to run (default 25)
-      --keep          Don't delete the SQLite file at exit
-      --db     PATH   Use this database path instead of a temp dir
+  -n, --count       N    Total messages to ingest (default 100000)
+  -b, --batch       N    Messages per transaction (default 5000)
+  -q, --queries     N    Number of random search queries to run (default 25)
+      --since-days  N    Constrain searches to messages newer than N synthetic days
+      --keep             Don't delete the SQLite file at exit
+      --db        PATH   Use this database path instead of a temp dir
 """
 
 // MARK: - Memory measurement (resident set, MB)
@@ -277,10 +282,18 @@ print("""
 let searchTerms = nounPool + verbPool
 var latencies: [Double] = []
 latencies.reserveCapacity(opts.searchQueries)
+
+// The synthetic generator uses `index * 60` seconds since reference date.
+// "N synthetic days" translates back to a since-date by counting backward
+// from the last-ingested message's timestamp.
+let since: Date? = opts.sinceDays.map { days in
+    let lastDate = Date(timeIntervalSinceReferenceDate: Double(opts.count - 1) * 60)
+    return lastDate.addingTimeInterval(-Double(days) * 86400)
+}
 for _ in 0..<opts.searchQueries {
     let q = "\(pick(searchTerms, rng: &rng)) \(pick(searchTerms, rng: &rng))"
     let qT0 = Date()
-    _ = try await store.search(q, limit: 50)
+    _ = try await store.search(q, since: since, limit: 50)
     latencies.append(-qT0.timeIntervalSinceNow)
 }
 latencies.sort()
@@ -289,8 +302,9 @@ let p95 = latencies[(latencies.count * 95) / 100]
 let max_ = latencies.last ?? 0
 let mean = latencies.reduce(0, +) / Double(latencies.count)
 
+let windowLabel = opts.sinceDays.map { "last \($0)d" } ?? "all time"
 print("""
- Search (FTS5, top-50 with snippet)
+ Search (FTS5, top-50 with snippet, weighted BM25, \(windowLabel))
    Queries       : \(opts.searchQueries)
    Mean / p50    : \(ms(mean)) / \(ms(p50))
    p95 / max     : \(ms(p95)) / \(ms(max_))

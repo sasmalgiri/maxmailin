@@ -87,6 +87,35 @@ final class MailStoreTests: XCTestCase {
         XCTAssertTrue(snip.contains("⟦deadline⟧"), "snippet should bracket the match: \(snip)")
     }
 
+    func testSearchSinceWindowExcludesOlderMessages() async throws {
+        let store = try MailStore(url: tempDB())
+        let acc = try await store.upsertAccount(name: "T", address: "t@x", kind: "local")
+        let now = Date()
+        // Old message: 200 days ago, contains "invoice".
+        _ = try await store.ingest(IngestMessage(
+            accountID: acc, folder: "INBOX", messageID: "<old@x>",
+            subject: "Ancient archive", fromAddress: "a@x",
+            date: now.addingTimeInterval(-200 * 86400), sizeBytes: 100,
+            plainBody: "Ancient invoice from another era."
+        ))
+        // Recent message: 5 days ago, also contains "invoice".
+        _ = try await store.ingest(IngestMessage(
+            accountID: acc, folder: "INBOX", messageID: "<new@x>",
+            subject: "This week", fromAddress: "b@x",
+            date: now.addingTimeInterval(-5 * 86400), sizeBytes: 100,
+            plainBody: "Latest invoice attached."
+        ))
+
+        let allHits = try await store.search("invoice", limit: 10)
+        XCTAssertEqual(allHits.count, 2)
+
+        let windowed = try await store.search("invoice",
+                                              since: now.addingTimeInterval(-30 * 86400),
+                                              limit: 10)
+        XCTAssertEqual(windowed.count, 1)
+        XCTAssertEqual(windowed.first?.messageID, "<new@x>")
+    }
+
     func testBodyIsNotLoadedByHeaderQuery() async throws {
         // Sanity: the headers() call returns no body field, and loadBody returns it on demand.
         let store = try MailStore(url: tempDB())
