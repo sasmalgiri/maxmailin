@@ -100,6 +100,14 @@ public final class SQLiteStatement {
     }
 
     @discardableResult
+    public func bind(_ index: Int32, _ value: Int64?) throws -> Self {
+        if let value { return try bind(index, value) }
+        let rc = sqlite3_bind_null(stmt, index)
+        if rc != SQLITE_OK { throw SQLiteError.bind(rc, "null int64 idx=\(index)") }
+        return self
+    }
+
+    @discardableResult
     public func bind(_ index: Int32, _ value: Int?) throws -> Self {
         if let value { return try bind(index, Int64(value)) }
         let rc = sqlite3_bind_null(stmt, index)

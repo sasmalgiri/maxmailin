@@ -10,7 +10,13 @@ import CryptoKit
 /// directory, which keeps APFS happy at scale:
 ///
 ///     <root>/<ab>/<cd>/<ab cd ef 01 02 ...>
-public actor BlobStore {
+///
+/// All operations are synchronous on top of FileManager (which is thread-safe
+/// on Apple platforms when using `.default`). Marked `@unchecked Sendable`
+/// because the store has no Swift-side mutable state — concurrency safety is
+/// delegated to the file system. This lets the `MailStore` actor call into the
+/// blob store from inside its sync SQLite transaction without an `await`.
+public final class BlobStore: @unchecked Sendable {
     public let root: URL
     private let fm = FileManager.default
 
@@ -20,7 +26,7 @@ public actor BlobStore {
     }
 
     /// Write `data` if absent, return its hex SHA-256 either way.
-    /// Idempotent — calling twice with the same bytes is a no-op.
+    /// Idempotent — duplicate puts collapse, races are tolerated.
     @discardableResult
     public func put(_ data: Data) throws -> String {
         let hex = Self.sha256Hex(data)
@@ -34,8 +40,11 @@ public actor BlobStore {
         do {
             try fm.moveItem(at: tmp, to: url)
         } catch {
+            // Another writer may have just placed an identical blob. Clean up
+            // our temp; if the destination now exists with the same hash, that's
+            // a successful idempotent put.
             try? fm.removeItem(at: tmp)
-            throw error
+            if !fm.fileExists(atPath: url.path) { throw error }
         }
         return hex
     }

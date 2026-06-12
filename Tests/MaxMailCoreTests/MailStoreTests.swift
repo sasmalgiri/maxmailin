@@ -116,6 +116,81 @@ final class MailStoreTests: XCTestCase {
         XCTAssertEqual(windowed.first?.messageID, "<new@x>")
     }
 
+    func testYearShardedSearchSpansShardsAndPrunes() async throws {
+        let store = try MailStore(url: tempDB())
+        let acc = try await store.upsertAccount(name: "T", address: "t@x", kind: "local")
+
+        // Three messages in three different years, all with "invoice" in body.
+        let cal = Calendar(identifier: .gregorian)
+        func dateInYear(_ y: Int) -> Date {
+            var c = DateComponents()
+            c.year = y; c.month = 6; c.day = 15
+            return cal.date(from: c)!
+        }
+        for (i, year) in [2022, 2024, 2026].enumerated() {
+            _ = try await store.ingest(IngestMessage(
+                accountID: acc, folder: "INBOX", messageID: "<m\(i)@x>",
+                subject: "Note \(year)", fromAddress: "a@x",
+                date: dateInYear(year), sizeBytes: 100,
+                plainBody: "Invoice for year \(year)."
+            ))
+        }
+
+        let shardYears = await store.shardYears()
+        XCTAssertEqual(shardYears, [2022, 2024, 2026], "one shard per year present in the data")
+
+        // All-time: spans all three shards.
+        let all = try await store.search("invoice", limit: 10)
+        XCTAssertEqual(all.count, 3)
+
+        // Windowed to 2025 onward: only 2026 shard contributes a hit.
+        var sinceC = DateComponents()
+        sinceC.year = 2025; sinceC.month = 1; sinceC.day = 1
+        let since = cal.date(from: sinceC)!
+        let recent = try await store.search("invoice", since: since, limit: 10)
+        XCTAssertEqual(recent.count, 1)
+        XCTAssertEqual(recent.first?.messageID, "<m2@x>")
+    }
+
+    func testAttachmentBlobIsDeduplicatedAcrossMessages() async throws {
+        let store = try MailStore(url: tempDB())
+        let acc = try await store.upsertAccount(name: "T", address: "t@x", kind: "local")
+        let pdfBytes = Data(repeating: 0xCC, count: 16 * 1024)
+
+        let id1 = try await store.ingest(IngestMessage(
+            accountID: acc, folder: "INBOX", messageID: "<a1@x>",
+            subject: "First mail with attachment", fromAddress: "a@x",
+            date: Date(), sizeBytes: 100,
+            plainBody: "see attached.",
+            attachments: [AttachmentIn(filename: "report.pdf", mimeType: "application/pdf", data: pdfBytes)]
+        ))
+        let id2 = try await store.ingest(IngestMessage(
+            accountID: acc, folder: "INBOX", messageID: "<a2@x>",
+            subject: "Forwarded mail same attachment", fromAddress: "b@x",
+            date: Date(), sizeBytes: 100,
+            plainBody: "FYI.",
+            attachments: [AttachmentIn(filename: "report.pdf", mimeType: "application/pdf", data: pdfBytes)]
+        ))
+
+        let refs1 = try await store.attachments(messageRowID: id1)
+        let refs2 = try await store.attachments(messageRowID: id2)
+        XCTAssertEqual(refs1.count, 1)
+        XCTAssertEqual(refs2.count, 1)
+        XCTAssertNotNil(refs1.first?.sha256Hex)
+        XCTAssertEqual(refs1.first?.sha256Hex, refs2.first?.sha256Hex,
+                       "identical attachment content must share a single sha256")
+        XCTAssertEqual(refs1.first?.sizeBytes, Int64(pdfBytes.count))
+
+        // The blob store itself should hold exactly one file.
+        let blobStats = try await store.blobStore.stats()
+        XCTAssertEqual(blobStats.count, 1, "identical bytes must dedupe to one blob")
+        XCTAssertEqual(blobStats.bytes, Int64(pdfBytes.count))
+
+        // Loading the attachment data round-trips.
+        let loaded = await store.loadAttachmentData(sha256Hex: refs1.first!.sha256Hex!)
+        XCTAssertEqual(loaded, pdfBytes)
+    }
+
     func testBodyIsNotLoadedByHeaderQuery() async throws {
         // Sanity: the headers() call returns no body field, and loadBody returns it on demand.
         let store = try MailStore(url: tempDB())

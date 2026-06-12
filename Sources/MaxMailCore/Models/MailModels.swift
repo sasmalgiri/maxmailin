@@ -1,5 +1,31 @@
 import Foundation
 
+/// An attachment to be ingested. If `data` is non-nil it's content-addressed
+/// into the BlobStore (duplicates dedupe automatically). If `data` is nil the
+/// attachment is recorded by name only — useful for archive imports where the
+/// bytes will be fetched on demand from the original mbox/eml later.
+public struct AttachmentIn: Sendable {
+    public let filename: String
+    public let mimeType: String?
+    public let data: Data?
+
+    public init(filename: String, mimeType: String? = nil, data: Data? = nil) {
+        self.filename = filename
+        self.mimeType = mimeType
+        self.data = data
+    }
+}
+
+/// Read-back record of an attachment row.
+public struct AttachmentRef: Sendable, Identifiable {
+    public let id: Int64
+    public let messageRowID: Int64
+    public let filename: String
+    public let mimeType: String?
+    public let sizeBytes: Int64?
+    public let sha256Hex: String?
+}
+
 /// A parsed message ready to be ingested into the store.
 /// Bodies are kept out of memory wherever possible; the caller streams them in.
 public struct IngestMessage: Sendable {
@@ -17,7 +43,7 @@ public struct IngestMessage: Sendable {
     public var flags: MessageFlags
     public var plainBody: String?         // pass nil if you'll attach a blob ref instead
     public var htmlBody: String?
-    public var attachmentNames: [String]
+    public var attachments: [AttachmentIn]
 
     public init(
         accountID: Int64,
@@ -34,7 +60,7 @@ public struct IngestMessage: Sendable {
         flags: MessageFlags = [],
         plainBody: String? = nil,
         htmlBody: String? = nil,
-        attachmentNames: [String] = []
+        attachments: [AttachmentIn] = []
     ) {
         self.accountID = accountID
         self.folder = folder
@@ -50,7 +76,7 @@ public struct IngestMessage: Sendable {
         self.flags = flags
         self.plainBody = plainBody
         self.htmlBody = htmlBody
-        self.attachmentNames = attachmentNames
+        self.attachments = attachments
     }
 }
 
