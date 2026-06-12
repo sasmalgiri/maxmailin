@@ -13,6 +13,7 @@ struct StressOptions {
     var sinceDays: Int? = nil
     var keepDB: Bool = false
     var dbPath: String?
+    var mboxPath: String? = nil
 
     static func parse(_ args: [String]) -> StressOptions {
         var opts = StressOptions()
@@ -32,6 +33,9 @@ struct StressOptions {
             case "--since-days":
                 i += 1
                 opts.sinceDays = Int(args[i])
+            case "--mbox":
+                i += 1
+                opts.mboxPath = args[i]
             case "--keep":
                 opts.keepDB = true
             case "--db":
@@ -51,14 +55,16 @@ struct StressOptions {
 }
 
 let usage = """
-maxmail-stress — synthetic 1 TB-trajectory scale test for MaxMailCore
+maxmail-stress — scale + import harness for MaxMailCore
 
-Usage: maxmail-stress [-n COUNT] [-b BATCH] [-q QUERIES] [--since-days N] [--keep] [--db PATH]
+Usage: maxmail-stress [-n COUNT] [-b BATCH] [-q QUERIES] [--since-days N]
+                      [--mbox PATH] [--keep] [--db PATH]
 
-  -n, --count       N    Total messages to ingest (default 100000)
+  -n, --count       N    Synthetic messages to ingest (default 100000)
   -b, --batch       N    Messages per transaction (default 5000)
   -q, --queries     N    Number of random search queries to run (default 25)
       --since-days  N    Constrain searches to messages newer than N synthetic days
+      --mbox      PATH   Skip synthetic generation and import this real mbox file
       --keep             Don't delete the SQLite file at exit
       --db        PATH   Use this database path instead of a temp dir
 """
@@ -208,33 +214,48 @@ print(String(format: "Memory at start: %.1f MB", memBefore))
 let store = try MailStore(url: dbURL)
 let accountID = try await store.upsertAccount(name: "Stress", address: "stress@local", kind: "synthetic")
 
-// Ingest
+// Ingest (synthetic generator or real mbox)
 let t0 = Date()
 var rng = SystemRandomNumberGenerator()
 var ingested = 0
 var batchPeakMem: Double = memBefore
 
-var batch: [IngestMessage] = []
-batch.reserveCapacity(opts.batchSize)
-
-for i in 0..<opts.count {
-    batch.append(makeMessage(accountID: accountID, index: i, rng: &rng))
-    if batch.count >= opts.batchSize {
-        _ = try await store.bulkIngest(batch)
-        ingested += batch.count
-        batch.removeAll(keepingCapacity: true)
+if let mboxPath = opts.mboxPath {
+    let url = URL(fileURLWithPath: mboxPath)
+    let importer = MboxImporter(store: store, accountID: accountID,
+                                options: .init(batchSize: opts.batchSize, folder: "INBOX"))
+    let (got, skipped) = try await importer.importFile(at: url) { p in
+        let pct = p.percentComplete * 100
+        let rate = p.secondsElapsed > 0 ? Int(Double(p.messagesIngested) / p.secondsElapsed) : 0
+        print(String(format: "  mbox %.1f%% — %@ ingested (%@ skipped)  %@/s",
+                     pct, fmt(Int(p.messagesIngested)),
+                     fmt(Int(p.messagesSkipped)), fmt(rate)))
         batchPeakMem = max(batchPeakMem, residentMemoryMB())
-        let elapsed = -t0.timeIntervalSinceNow
-        if ingested % (opts.batchSize * 4) == 0 || ingested == opts.count {
-            print(String(format: "  ingested %@ / %@  (%.1fs, %@ ingest)",
-                         fmt(ingested), fmt(opts.count), elapsed,
-                         rate(ingested, seconds: elapsed)))
+    }
+    ingested = Int(got)
+    print("  done: \(fmt(Int(got))) ingested, \(fmt(Int(skipped))) duplicates")
+} else {
+    var batch: [IngestMessage] = []
+    batch.reserveCapacity(opts.batchSize)
+    for i in 0..<opts.count {
+        batch.append(makeMessage(accountID: accountID, index: i, rng: &rng))
+        if batch.count >= opts.batchSize {
+            _ = try await store.bulkIngest(batch)
+            ingested += batch.count
+            batch.removeAll(keepingCapacity: true)
+            batchPeakMem = max(batchPeakMem, residentMemoryMB())
+            let elapsed = -t0.timeIntervalSinceNow
+            if ingested % (opts.batchSize * 4) == 0 || ingested == opts.count {
+                print(String(format: "  ingested %@ / %@  (%.1fs, %@ ingest)",
+                             fmt(ingested), fmt(opts.count), elapsed,
+                             rate(ingested, seconds: elapsed)))
+            }
         }
     }
-}
-if !batch.isEmpty {
-    _ = try await store.bulkIngest(batch)
-    ingested += batch.count
+    if !batch.isEmpty {
+        _ = try await store.bulkIngest(batch)
+        ingested += batch.count
+    }
 }
 let ingestSeconds = -t0.timeIntervalSinceNow
 let memAfterIngest = residentMemoryMB()
