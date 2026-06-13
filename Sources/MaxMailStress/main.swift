@@ -230,8 +230,8 @@ if let mboxPath = opts.mboxPath {
         print(String(format: "  mbox %.1f%% — %@ ingested (%@ skipped)  %@/s",
                      pct, fmt(Int(p.messagesIngested)),
                      fmt(Int(p.messagesSkipped)), fmt(rate)))
-        batchPeakMem = max(batchPeakMem, residentMemoryMB())
     }
+    batchPeakMem = max(batchPeakMem, residentMemoryMB())
     ingested = Int(got)
     print("  done: \(fmt(Int(got))) ingested, \(fmt(Int(skipped))) duplicates")
 } else {

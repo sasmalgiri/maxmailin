@@ -6,7 +6,15 @@ A full-fledged Apple-platform mail client that scales to **1 TB+** archives, wit
 
 ## Status
 
-Phase 1 — **storage foundation**. Nothing here is a usable app yet. The first thing being built is the core data layer (`MaxMailCore`) that the entire client will sit on top of.
+Phases 1 through 4 (Mac-only first-cut UI) are in.
+
+- **MaxMailCore** — SQLite + per-year FTS5 shards, content-addressed BlobStore,
+  streaming mbox parser with RFC 5322 + MIME multipart. 11k inserts/sec, sub-100ms
+  search on the recent window at 1 M messages, RSS bounded ~130 MB.
+- **MaxMailApp** — SwiftUI three-pane (folders / list / detail) on macOS, opens
+  a persistent store at `~/Library/Application Support/maxmailin/mail.sqlite`,
+  imports an `.mbox` via the toolbar.
+- **maxmail-stress** — synthetic scale harness + `--mbox` real-archive ingest.
 
 ## Architecture
 
@@ -45,12 +53,25 @@ Phase 1 — **storage foundation**. Nothing here is a usable app yet. The first 
 ## Project layout
 
 ```
-Sources/MaxMailCore/
-  SQLite/      → thin sqlite3 C-API wrapper
-  Models/      → MailMessage, MailFolder, Account types
-  Store/       → MailStore actor (schema, ingest, query, search)
+Sources/
+  MaxMailCore/
+    SQLite/    → thin sqlite3 C-API wrapper
+    Models/    → IngestMessage, MessageHeader, AttachmentIn/Ref, SearchHit
+    Store/     → MailStore actor, BlobStore (SHA-256 content-addressed)
+    Import/    → MboxStream (mmap), RFC5322Parser, MIMEParser, MboxImporter
+  MaxMailStress/    → CLI scale harness (synthetic + --mbox)
+  MaxMailApp/       → SwiftUI app (macOS first cut: three-pane, import, search)
 Tests/MaxMailCoreTests/
 ```
+
+## Running the app
+
+```
+swift run maxmail-app
+```
+
+Then use **Import mbox…** in the toolbar (or ⌘I) to bring an archive in.
+The store persists at `~/Library/Application Support/maxmailin/mail.sqlite`.
 
 ## License
 

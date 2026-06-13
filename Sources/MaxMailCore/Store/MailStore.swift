@@ -631,6 +631,39 @@ public actor MailStore {
 
     public func shardYears() -> [Int] { knownShards.sorted() }
 
+    public func accountsList() throws -> [(id: Int64, name: String, address: String)] {
+        let stmt = try conn.prepare("SELECT id, name, address FROM accounts ORDER BY name;")
+        var out: [(Int64, String, String)] = []
+        try stmt.forEachRow { row in
+            out.append((row.int64(0), row.string(1) ?? "", row.string(2) ?? ""))
+            return true
+        }
+        return out
+    }
+
+    public func folders(accountID: Int64) throws -> [String] {
+        let stmt = try conn.prepare("SELECT path FROM folders WHERE account_id = ? ORDER BY path;")
+        try stmt.bind(1, accountID)
+        var out: [String] = []
+        try stmt.forEachRow { row in
+            if let p = row.string(0) { out.append(p) }
+            return true
+        }
+        return out
+    }
+
+    public func messageCount(accountID: Int64, folder: String) throws -> Int64 {
+        let stmt = try conn.prepare("""
+        SELECT COUNT(*) FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE f.account_id = ? AND f.path = ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, folder)
+        var n: Int64 = 0
+        try stmt.forEachRow { row in n = row.int64(0); return false }
+        return n
+    }
+
     public func checkpoint() throws {
         try conn.exec("PRAGMA wal_checkpoint(TRUNCATE);")
     }

@@ -103,6 +103,22 @@ public struct MessageHeader: Sendable, Identifiable {
     public let sizeBytes: Int64
     public let flags: MessageFlags
     public let snippet: String?
+
+    public init(
+        id: Int64, messageID: String, folder: String,
+        subject: String, fromAddress: String, date: Date,
+        sizeBytes: Int64, flags: MessageFlags, snippet: String?
+    ) {
+        self.id = id
+        self.messageID = messageID
+        self.folder = folder
+        self.subject = subject
+        self.fromAddress = fromAddress
+        self.date = date
+        self.sizeBytes = sizeBytes
+        self.flags = flags
+        self.snippet = snippet
+    }
 }
 
 public struct SearchHit: Sendable, Identifiable {

@@ -11,6 +11,7 @@ let package = Package(
     products: [
         .library(name: "MaxMailCore", targets: ["MaxMailCore"]),
         .executable(name: "maxmail-stress", targets: ["MaxMailStress"]),
+        .executable(name: "maxmail-app", targets: ["MaxMailApp"]),
     ],
     targets: [
         .target(
@@ -21,6 +22,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "MaxMailStress",
+            dependencies: ["MaxMailCore"]
+        ),
+        .executableTarget(
+            name: "MaxMailApp",
             dependencies: ["MaxMailCore"]
         ),
         .testTarget(
