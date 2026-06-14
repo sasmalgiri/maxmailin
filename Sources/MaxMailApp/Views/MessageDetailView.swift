@@ -15,6 +15,9 @@ struct MessageDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     headerBlock
+                    if let nlp = model.currentNLP {
+                        NLPInsightsView(nlp: nlp)
+                    }
                     Divider()
                     bodyBlock
                     if !model.currentAttachments.isEmpty {

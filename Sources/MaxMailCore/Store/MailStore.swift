@@ -39,7 +39,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 2
+    private static let schemaVersion: Int64 = 3
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -164,6 +164,25 @@ public actor MailStore {
                 }
 
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '2');")
+            }
+        }
+
+        if current < 3 {
+            try conn.transaction {
+                // Per-message on-device NLP cache. Sentiment / language /
+                // entities / keywords for the body. Lazily filled by
+                // ensureNLP(messageRowID:) on first access.
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS message_nlp (
+                    message_id     INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    sentiment      REAL NOT NULL,
+                    language       TEXT,
+                    entities_json  TEXT,
+                    keywords_json  TEXT,
+                    analyzed_at    INTEGER NOT NULL
+                );
+                """)
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '3');")
             }
         }
     }
@@ -669,6 +688,93 @@ public actor MailStore {
     }
 
     // MARK: - Helpers
+
+    // MARK: - NLP
+
+    /// Lazy on-device NLP. Returns the cached result if present, otherwise
+    /// runs sentiment / language / entity / keyword extraction over the
+    /// message body and stores it for next time. Identity bodies (mailing-
+    /// list duplicates) don't dedupe at this layer yet — each message gets
+    /// its own analysis row.
+    @discardableResult
+    public func ensureNLP(messageRowID: Int64) throws -> EmailNLP {
+        if let cached = try loadNLP(messageRowID: messageRowID) { return cached }
+        guard let body = try loadBody(messageRowID: messageRowID),
+              let text = body.plain ?? stripHTML(body.html),
+              !text.isEmpty
+        else {
+            let empty = EmailNLP.empty
+            try persistNLP(messageRowID: messageRowID, nlp: empty)
+            return empty
+        }
+        let nlp = EmailNLPAnalyzer.analyze(text: text)
+        try persistNLP(messageRowID: messageRowID, nlp: nlp)
+        return nlp
+    }
+
+    public func loadNLP(messageRowID: Int64) throws -> EmailNLP? {
+        let stmt = try conn.prepare("""
+        SELECT sentiment, language, entities_json, keywords_json
+          FROM message_nlp WHERE message_id = ?;
+        """)
+        try stmt.bind(1, messageRowID)
+        var found: EmailNLP?
+        try stmt.forEachRow { row in
+            let sentiment = Double(row.string(0) ?? "0") ?? 0
+            let language = row.isNull(1) ? nil : row.string(1)
+            let entities: [EmailEntity] = decodeJSON(row.string(2)) ?? []
+            let keywords: [String]     = decodeJSON(row.string(3)) ?? []
+            found = EmailNLP(sentiment: sentiment, language: language,
+                             entities: entities, keywords: keywords)
+            return false
+        }
+        return found
+    }
+
+    private func persistNLP(messageRowID: Int64, nlp: EmailNLP) throws {
+        let enc = JSONEncoder()
+        let entJSON = (try? String(data: enc.encode(nlp.entities), encoding: .utf8)) ?? "[]"
+        let kwJSON  = (try? String(data: enc.encode(nlp.keywords), encoding: .utf8)) ?? "[]"
+        let stmt = try conn.prepare("""
+        INSERT INTO message_nlp(message_id, sentiment, language, entities_json, keywords_json, analyzed_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            sentiment     = excluded.sentiment,
+            language      = excluded.language,
+            entities_json = excluded.entities_json,
+            keywords_json = excluded.keywords_json,
+            analyzed_at   = excluded.analyzed_at;
+        """)
+        try stmt.bind(1, messageRowID)
+        try stmt.bind(2, String(nlp.sentiment))
+        try stmt.bind(3, nlp.language)
+        try stmt.bind(4, entJSON)
+        try stmt.bind(5, kwJSON)
+        try stmt.bind(6, Int64(Date().timeIntervalSince1970))
+        try stmt.run()
+    }
+
+    private func decodeJSON<T: Decodable>(_ s: String?) -> T? {
+        guard let s, let data = s.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func stripHTML(_ html: String?) -> String? {
+        guard let html else { return nil }
+        // Very cheap tag strip — enough for keyword/entity work. Detail view
+        // still renders the real HTML via WKWebView; this is only the text
+        // feed for the NLP pass.
+        var out = ""
+        var inTag = false
+        for ch in html {
+            if inTag {
+                if ch == ">" { inTag = false }
+            } else {
+                if ch == "<" { inTag = true } else { out.append(ch) }
+            }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     private func makeSnippet(plain: String?, html: String?) -> String? {
         let raw = plain ?? html

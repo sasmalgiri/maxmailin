@@ -29,6 +29,7 @@ final class MailViewModel {
 
     var currentBody: (plain: String?, html: String?)?
     var currentAttachments: [AttachmentRef] = []
+    var currentNLP: EmailNLP?
 
     var searchText: String = ""
     var searchResults: [SearchHit] = []
@@ -112,12 +113,26 @@ final class MailViewModel {
 
     func selectMessage(rowID: Int64) async {
         selectedMessageID = rowID
+        currentNLP = nil
         guard let store else { return }
         do {
             let body = try await store.loadBody(messageRowID: rowID)
             let atts = try await store.attachments(messageRowID: rowID)
             self.currentBody = body
             self.currentAttachments = atts
+            // Kick off NLP lazily; selection of *another* message before this
+            // completes is fine because we re-check the selection below.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let nlp = try await store.ensureNLP(messageRowID: rowID)
+                    if self.selectedMessageID == rowID {
+                        self.currentNLP = nlp
+                    }
+                } catch {
+                    self.errorMessage = error.localizedDescription
+                }
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
