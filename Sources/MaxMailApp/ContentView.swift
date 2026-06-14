@@ -32,12 +32,24 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    model.showAnalytics = true
+                } label: {
+                    Label("Insights", systemImage: "chart.line.uptrend.xyaxis")
+                }
+                .disabled(model.selectedAccount == nil)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     model.requestImport()
                 } label: {
                     Label("Import mbox…", systemImage: "tray.and.arrow.down")
                 }
                 .disabled(model.isImporting)
             }
+        }
+        .sheet(isPresented: $bindable.showAnalytics) {
+            AnalyticsView()
+                .environment(model)
         }
         .fileImporter(
             isPresented: $bindable.showImportPicker,

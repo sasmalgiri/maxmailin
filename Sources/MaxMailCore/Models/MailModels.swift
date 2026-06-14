@@ -137,3 +137,54 @@ public struct StoreStats: Sendable {
     public let accountCount: Int64
     public let dbFileBytes: Int64
 }
+
+// MARK: - Analytics aggregates
+
+public struct AnalysisProgress: Sendable {
+    public let analyzed: Int64
+    public let total: Int64
+    public var percentComplete: Double {
+        total == 0 ? 1 : Double(analyzed) / Double(total)
+    }
+    public init(analyzed: Int64, total: Int64) {
+        self.analyzed = analyzed
+        self.total = total
+    }
+}
+
+public struct SentimentDistribution: Sendable {
+    public let veryNegative: Int
+    public let negative: Int
+    public let neutral: Int
+    public let positive: Int
+    public let veryPositive: Int
+    public var total: Int {
+        veryNegative + negative + neutral + positive + veryPositive
+    }
+    public init(veryNegative: Int, negative: Int, neutral: Int, positive: Int, veryPositive: Int) {
+        self.veryNegative = veryNegative
+        self.negative = negative
+        self.neutral = neutral
+        self.positive = positive
+        self.veryPositive = veryPositive
+    }
+}
+
+public struct EntityCount: Sendable, Identifiable, Hashable {
+    public let entity: EmailEntity
+    public let count: Int
+    public var id: String { "\(entity.kind.rawValue)|\(entity.text.lowercased())" }
+}
+
+public struct KeywordCount: Sendable, Identifiable, Hashable {
+    public let keyword: String
+    public let count: Int
+    public var id: String { keyword }
+}
+
+public struct SentimentMonth: Sendable, Identifiable, Hashable {
+    public let month: String        // "YYYY-MM"
+    public let meanSentiment: Double
+    public let messageCount: Int
+    public var id: String { month }
+}

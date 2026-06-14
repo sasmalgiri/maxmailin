@@ -40,10 +40,23 @@ final class MailViewModel {
     var importStatus: String = ""
     var showImportPicker: Bool = false
 
+    var showAnalytics: Bool = false
+    var isBackgroundAnalyzing: Bool = false
+    var analyticsProgress: AnalysisProgress = AnalysisProgress(analyzed: 0, total: 0)
+    var analyticsDistribution: SentimentDistribution = SentimentDistribution(
+        veryNegative: 0, negative: 0, neutral: 0, positive: 0, veryPositive: 0
+    )
+    var analyticsTimeline: [SentimentMonth] = []
+    var analyticsKeywords: [KeywordCount] = []
+    var analyticsEntities: [EntityCount] = []
+
+    private var analyzer: BackgroundAnalyzer?
+
     var statusMessage: String = "Loading…"
     var errorMessage: String?
 
     func bootstrap() async {
+        Self.sharedInstance = self
         do {
             let url = Self.defaultDBURL()
             let s = try MailStore(url: url)
@@ -159,6 +172,61 @@ final class MailViewModel {
         searchText = ""
         searchResults = []
         isSearching = false
+    }
+
+    // MARK: - Analytics + background NLP
+
+    func refreshAnalytics() async {
+        guard let store, let acc = selectedAccount else { return }
+        do {
+            analyticsProgress     = try await store.analysisProgress(accountID: acc.id)
+            analyticsDistribution = try await store.sentimentDistribution(accountID: acc.id)
+            analyticsTimeline     = try await store.sentimentTimeline(accountID: acc.id)
+            analyticsKeywords     = try await store.topKeywords(accountID: acc.id, limit: 25)
+            analyticsEntities     = try await store.topEntities(accountID: acc.id, limit: 25)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func startAnalysis() async {
+        guard let store, let acc = selectedAccount else { return }
+        if analyzer == nil { analyzer = BackgroundAnalyzer(store: store) }
+        isBackgroundAnalyzing = true
+        await analyzer?.start(accountID: acc.id, batchSize: 50) { @Sendable progress in
+            await Self.deliverProgress(progress)
+        }
+    }
+
+    /// Routes progress updates from the background analyzer's Task.detached
+    /// context back to the main-actor view model singleton. We resolve the
+    /// shared instance via a static lookup so the @Sendable closure never
+    /// captures `self`.
+    @MainActor
+    private static func deliverProgress(_ progress: AnalysisProgress) {
+        let vm = MailViewModel.shared
+        vm.analyticsProgress = progress
+        if progress.analyzed >= progress.total {
+            vm.isBackgroundAnalyzing = false
+            Task { await vm.refreshAnalytics() }
+        }
+    }
+
+    /// Singleton handle so background callbacks can deliver back to the
+    /// owning view model without capturing it. Only one MailViewModel is
+    /// ever instantiated (by MaxMailApp.scene); registered in bootstrap.
+    @MainActor private static weak var sharedInstance: MailViewModel?
+    @MainActor static var shared: MailViewModel {
+        guard let s = sharedInstance else {
+            preconditionFailure("MailViewModel.shared accessed before bootstrap()")
+        }
+        return s
+    }
+
+    func stopAnalysis() async {
+        await analyzer?.cancel()
+        isBackgroundAnalyzing = false
+        await refreshAnalytics()
     }
 
     // MARK: - Import

@@ -712,6 +712,163 @@ public actor MailStore {
         return nlp
     }
 
+    /// IDs of messages that don't yet have an NLP row. Newest first so the
+    /// user-visible mail gets analyzed first; perfect for incremental
+    /// background runs.
+    public func unanalyzedMessageIDs(accountID: Int64, limit: Int = 200) throws -> [Int64] {
+        let stmt = try conn.prepare("""
+        SELECT m.id FROM messages m
+          LEFT JOIN message_nlp n ON n.message_id = m.id
+         WHERE m.account_id = ? AND n.message_id IS NULL
+         ORDER BY m.date_unix DESC, m.id DESC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [Int64] = []
+        try stmt.forEachRow { row in out.append(row.int64(0)); return true }
+        return out
+    }
+
+    public func analysisProgress(accountID: Int64) throws -> AnalysisProgress {
+        let total = try messageCountFor(accountID: accountID)
+        let analyzedStmt = try conn.prepare("""
+        SELECT COUNT(*) FROM message_nlp n
+          JOIN messages m ON m.id = n.message_id
+         WHERE m.account_id = ?;
+        """)
+        try analyzedStmt.bind(1, accountID)
+        var analyzed: Int64 = 0
+        try analyzedStmt.forEachRow { row in analyzed = row.int64(0); return false }
+        return AnalysisProgress(analyzed: analyzed, total: total)
+    }
+
+    private func messageCountFor(accountID: Int64) throws -> Int64 {
+        let stmt = try conn.prepare("SELECT COUNT(*) FROM messages WHERE account_id = ?;")
+        try stmt.bind(1, accountID)
+        var n: Int64 = 0
+        try stmt.forEachRow { row in n = row.int64(0); return false }
+        return n
+    }
+
+    /// Run NLP for up to `batchSize` unanalyzed messages. Caller drives the
+    /// outer loop and yields the actor between batches so search / paging
+    /// stay responsive during a long catch-up.
+    @discardableResult
+    public func analyzeBatch(accountID: Int64, batchSize: Int = 100) throws -> Int {
+        let ids = try unanalyzedMessageIDs(accountID: accountID, limit: batchSize)
+        for id in ids {
+            _ = try ensureNLP(messageRowID: id)
+        }
+        return ids.count
+    }
+
+    // MARK: - NLP aggregates (analytics)
+
+    public func sentimentDistribution(accountID: Int64) throws -> SentimentDistribution {
+        let stmt = try conn.prepare("""
+        SELECT
+            SUM(CASE WHEN sentiment < -0.6 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN sentiment >= -0.6 AND sentiment < -0.2 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN sentiment >= -0.2 AND sentiment <  0.2 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN sentiment >=  0.2 AND sentiment <  0.6 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN sentiment >= 0.6 THEN 1 ELSE 0 END)
+          FROM message_nlp n
+          JOIN messages m ON m.id = n.message_id
+         WHERE m.account_id = ?;
+        """)
+        try stmt.bind(1, accountID)
+        var vn = 0, n = 0, ne = 0, po = 0, vp = 0
+        try stmt.forEachRow { row in
+            vn = row.int(0); n = row.int(1); ne = row.int(2); po = row.int(3); vp = row.int(4)
+            return false
+        }
+        return SentimentDistribution(
+            veryNegative: vn, negative: n, neutral: ne, positive: po, veryPositive: vp
+        )
+    }
+
+    public func topKeywords(accountID: Int64, limit: Int = 30) throws -> [KeywordCount] {
+        // SQLite's built-in json1 extension lets us explode each
+        // keywords_json array row into one row per keyword.
+        let stmt = try conn.prepare("""
+        SELECT je.value AS keyword, COUNT(*) AS n
+          FROM message_nlp mn
+          JOIN messages m ON m.id = mn.message_id
+          JOIN json_each(mn.keywords_json) je
+         WHERE m.account_id = ?
+         GROUP BY keyword
+         ORDER BY n DESC, keyword ASC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [KeywordCount] = []
+        try stmt.forEachRow { row in
+            if let kw = row.string(0) {
+                out.append(KeywordCount(keyword: kw, count: row.int(1)))
+            }
+            return true
+        }
+        return out
+    }
+
+    public func topEntities(accountID: Int64, kind: EmailEntity.Kind? = nil, limit: Int = 30) throws -> [EntityCount] {
+        let kindFilter: String
+        if let kind { kindFilter = "AND json_extract(je.value, '$.kind') = '\(kind.rawValue)'" }
+        else        { kindFilter = "" }
+        let sql = """
+        SELECT json_extract(je.value, '$.kind') AS kind,
+               json_extract(je.value, '$.text') AS text,
+               COUNT(*) AS n
+          FROM message_nlp mn
+          JOIN messages m ON m.id = mn.message_id
+          JOIN json_each(mn.entities_json) je
+         WHERE m.account_id = ? \(kindFilter)
+         GROUP BY kind, text
+         ORDER BY n DESC, text ASC
+         LIMIT ?;
+        """
+        let stmt = try conn.prepare(sql)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [EntityCount] = []
+        try stmt.forEachRow { row in
+            let kindStr = row.string(0) ?? "other"
+            let text = row.string(1) ?? ""
+            let entityKind = EmailEntity.Kind(rawValue: kindStr) ?? .other
+            out.append(EntityCount(
+                entity: EmailEntity(kind: entityKind, text: text),
+                count: row.int(2)
+            ))
+            return true
+        }
+        return out
+    }
+
+    public func sentimentTimeline(accountID: Int64) throws -> [SentimentMonth] {
+        let stmt = try conn.prepare("""
+        SELECT strftime('%Y-%m', m.date_unix, 'unixepoch') AS month,
+               AVG(n.sentiment) AS mean,
+               COUNT(*) AS c
+          FROM message_nlp n
+          JOIN messages m ON m.id = n.message_id
+         WHERE m.account_id = ?
+         GROUP BY month
+         ORDER BY month ASC;
+        """)
+        try stmt.bind(1, accountID)
+        var out: [SentimentMonth] = []
+        try stmt.forEachRow { row in
+            if let m = row.string(0) {
+                let mean = Double(row.string(1) ?? "0") ?? 0
+                out.append(SentimentMonth(month: m, meanSentiment: mean, messageCount: row.int(2)))
+            }
+            return true
+        }
+        return out
+    }
+
     public func loadNLP(messageRowID: Int64) throws -> EmailNLP? {
         let stmt = try conn.prepare("""
         SELECT sentiment, language, entities_json, keywords_json
