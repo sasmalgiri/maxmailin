@@ -15,6 +15,10 @@ struct MessageDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     headerBlock
+                    if let forensics = model.currentForensics,
+                       forensics.phishing.level != .none || !forensics.pii.isEmpty {
+                        ForensicInsightsView(result: forensics)
+                    }
                     if let nlp = model.currentNLP {
                         NLPInsightsView(nlp: nlp)
                     }

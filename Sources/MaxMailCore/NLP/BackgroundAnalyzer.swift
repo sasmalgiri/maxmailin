@@ -46,10 +46,10 @@ public actor BackgroundAnalyzer {
         defer { self.task = nil }
         while !Task.isCancelled {
             do {
-                let processed = try await store.analyzeBatch(
+                let processed = try await store.processBatch(
                     accountID: accountID, batchSize: batchSize
                 )
-                let progress = (try? await store.analysisProgress(accountID: accountID))
+                let progress = (try? await store.processingProgress(accountID: accountID))
                     ?? AnalysisProgress(analyzed: 0, total: 0)
                 if let onProgress { await onProgress(progress) }
                 if processed == 0 { return }  // nothing left to do

@@ -39,7 +39,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 3
+    private static let schemaVersion: Int64 = 4
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -183,6 +183,25 @@ public actor MailStore {
                 );
                 """)
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '3');")
+            }
+        }
+
+        if current < 4 {
+            try conn.transaction {
+                // Per-message forensic cache: phishing risk + PII findings.
+                // Lazily filled by ensureForensics(messageRowID:).
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS message_forensics (
+                    message_id            INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    phishing_score        INTEGER NOT NULL,
+                    phishing_level        TEXT NOT NULL,
+                    phishing_reasons_json TEXT,
+                    pii_json              TEXT,
+                    analyzed_at           INTEGER NOT NULL
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_forensics_phishing_level ON message_forensics(phishing_level);")
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '4');")
             }
         }
     }
@@ -763,6 +782,49 @@ public actor MailStore {
         return ids.count
     }
 
+    /// Process a batch end-to-end: NLP + forensics. Used by the BackgroundAnalyzer
+    /// so we walk each unprocessed message exactly once and share the body load.
+    @discardableResult
+    public func processBatch(accountID: Int64, batchSize: Int = 100) throws -> Int {
+        let ids = try unprocessedMessageIDs(accountID: accountID, limit: batchSize)
+        for id in ids {
+            _ = try ensureNLP(messageRowID: id)
+            _ = try ensureForensics(messageRowID: id)
+        }
+        return ids.count
+    }
+
+    /// Messages missing NLP *or* forensics. Newest first.
+    public func unprocessedMessageIDs(accountID: Int64, limit: Int = 200) throws -> [Int64] {
+        let stmt = try conn.prepare("""
+        SELECT m.id FROM messages m
+          LEFT JOIN message_nlp       n ON n.message_id = m.id
+          LEFT JOIN message_forensics f ON f.message_id = m.id
+         WHERE m.account_id = ? AND (n.message_id IS NULL OR f.message_id IS NULL)
+         ORDER BY m.date_unix DESC, m.id DESC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [Int64] = []
+        try stmt.forEachRow { row in out.append(row.int64(0)); return true }
+        return out
+    }
+
+    public func processingProgress(accountID: Int64) throws -> AnalysisProgress {
+        let total = try messageCountFor(accountID: accountID)
+        let stmt = try conn.prepare("""
+        SELECT COUNT(*) FROM messages m
+          JOIN message_nlp       n ON n.message_id = m.id
+          JOIN message_forensics f ON f.message_id = m.id
+         WHERE m.account_id = ?;
+        """)
+        try stmt.bind(1, accountID)
+        var done: Int64 = 0
+        try stmt.forEachRow { row in done = row.int64(0); return false }
+        return AnalysisProgress(analyzed: done, total: total)
+    }
+
     // MARK: - NLP aggregates (analytics)
 
     public func sentimentDistribution(accountID: Int64) throws -> SentimentDistribution {
@@ -909,6 +971,79 @@ public actor MailStore {
         try stmt.bind(5, kwJSON)
         try stmt.bind(6, Int64(Date().timeIntervalSince1970))
         try stmt.run()
+    }
+
+    // MARK: - Forensics
+
+    @discardableResult
+    public func ensureForensics(messageRowID: Int64) throws -> ForensicResult {
+        if let cached = try loadForensics(messageRowID: messageRowID) { return cached }
+        let meta = try fetchMessageMeta(messageRowID: messageRowID)
+        let body = try loadBody(messageRowID: messageRowID)
+        let result = EmailForensicAnalyzer.analyze(
+            subject: meta?.subject ?? "",
+            fromAddress: meta?.fromAddr ?? "",
+            plainBody: body?.plain,
+            htmlBody: body?.html
+        )
+        try persistForensics(messageRowID: messageRowID, result: result)
+        return result
+    }
+
+    public func loadForensics(messageRowID: Int64) throws -> ForensicResult? {
+        let stmt = try conn.prepare("""
+        SELECT phishing_score, phishing_level, phishing_reasons_json, pii_json
+          FROM message_forensics WHERE message_id = ?;
+        """)
+        try stmt.bind(1, messageRowID)
+        var result: ForensicResult?
+        try stmt.forEachRow { row in
+            let score = row.int(0)
+            let levelRaw = row.string(1) ?? "none"
+            let level = PhishingFinding.RiskLevel(rawValue: levelRaw) ?? .none
+            let reasons: [PhishingReason] = self.decodeJSON(row.string(2)) ?? []
+            let pii: [PIIFinding] = self.decodeJSON(row.string(3)) ?? []
+            result = ForensicResult(
+                phishing: PhishingFinding(level: level, score: score, reasons: reasons),
+                pii: pii
+            )
+            return false
+        }
+        return result
+    }
+
+    private func persistForensics(messageRowID: Int64, result: ForensicResult) throws {
+        let enc = JSONEncoder()
+        let reasonsJSON = (try? String(data: enc.encode(result.phishing.reasons), encoding: .utf8)) ?? "[]"
+        let piiJSON     = (try? String(data: enc.encode(result.pii), encoding: .utf8)) ?? "[]"
+        let stmt = try conn.prepare("""
+        INSERT INTO message_forensics(message_id, phishing_score, phishing_level, phishing_reasons_json, pii_json, analyzed_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            phishing_score        = excluded.phishing_score,
+            phishing_level        = excluded.phishing_level,
+            phishing_reasons_json = excluded.phishing_reasons_json,
+            pii_json              = excluded.pii_json,
+            analyzed_at           = excluded.analyzed_at;
+        """)
+        try stmt.bind(1, messageRowID)
+        try stmt.bind(2, Int64(result.phishing.score))
+        try stmt.bind(3, result.phishing.level.rawValue)
+        try stmt.bind(4, reasonsJSON)
+        try stmt.bind(5, piiJSON)
+        try stmt.bind(6, Int64(Date().timeIntervalSince1970))
+        try stmt.run()
+    }
+
+    private func fetchMessageMeta(messageRowID: Int64) throws -> (subject: String, fromAddr: String)? {
+        let stmt = try conn.prepare("SELECT subject, from_addr FROM messages WHERE id = ?;")
+        try stmt.bind(1, messageRowID)
+        var meta: (String, String)?
+        try stmt.forEachRow { row in
+            meta = (row.string(0) ?? "", row.string(1) ?? "")
+            return false
+        }
+        return meta
     }
 
     private func decodeJSON<T: Decodable>(_ s: String?) -> T? {
