@@ -1,5 +1,6 @@
 import SwiftUI
 import MaxMailCore
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(MailViewModel.self) private var model
@@ -31,11 +32,23 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    Task { await model.importMbox() }
+                    model.requestImport()
                 } label: {
                     Label("Import mbox…", systemImage: "tray.and.arrow.down")
                 }
                 .disabled(model.isImporting)
+            }
+        }
+        .fileImporter(
+            isPresented: $bindable.showImportPicker,
+            allowedContentTypes: [.data],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { Task { await model.importMbox(at: url) } }
+            case .failure(let error):
+                model.errorMessage = "File picker: \(error.localizedDescription)"
             }
         }
         .searchable(text: $bindable.searchText, prompt: "Search mail")

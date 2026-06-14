@@ -1,9 +1,6 @@
 import Foundation
 import MaxMailCore
 import Observation
-#if canImport(AppKit)
-import AppKit
-#endif
 
 struct AccountSummary: Identifiable, Hashable {
     let id: Int64
@@ -40,6 +37,7 @@ final class MailViewModel {
     var isImporting: Bool = false
     var importProgress: Double = 0
     var importStatus: String = ""
+    var showImportPicker: Bool = false
 
     var statusMessage: String = "Loading…"
     var errorMessage: String?
@@ -150,17 +148,10 @@ final class MailViewModel {
 
     // MARK: - Import
 
-    func importMbox() async {
-        #if canImport(AppKit)
-        let panel = NSOpenPanel()
-        panel.title = "Choose an mbox file to import"
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        let response = panel.runModal()
-        guard response == .OK, let url = panel.url else { return }
-        await importMbox(at: url)
-        #endif
+    /// Trigger the SwiftUI .fileImporter sheet. Actual file selection comes
+    /// back through importMbox(at:) once the user picks something.
+    func requestImport() {
+        showImportPicker = true
     }
 
     func importMbox(at url: URL) async {

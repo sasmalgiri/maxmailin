@@ -17,7 +17,7 @@ struct MaxMailApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Import mbox…") {
-                    Task { await model.importMbox() }
+                    model.requestImport()
                 }
                 .keyboardShortcut("i", modifiers: [.command])
             }

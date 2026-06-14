@@ -63,19 +63,14 @@ struct MessageDetailView: View {
     }
 
     @ViewBuilder private var bodyBlock: some View {
-        if let plain = model.currentBody?.plain, !plain.isEmpty {
+        if let html = model.currentBody?.html, !html.isEmpty {
+            EmailHTMLView(html: html)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else if let plain = model.currentBody?.plain, !plain.isEmpty {
             Text(plain)
                 .font(.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        } else if let html = model.currentBody?.html, !html.isEmpty {
-            // First cut: show the HTML source. WKWebView rendering comes later.
-            Text("HTML body (raw source — renderer in next phase):")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(html)
-                .font(.system(.body, design: .monospaced))
-                .textSelection(.enabled)
         } else {
             Text("(no body)").foregroundStyle(.secondary)
         }
@@ -86,27 +81,7 @@ struct MessageDetailView: View {
             Text("Attachments (\(model.currentAttachments.count))")
                 .font(.headline)
             ForEach(model.currentAttachments) { att in
-                HStack(spacing: 10) {
-                    Image(systemName: iconForMIME(att.mimeType))
-                        .foregroundStyle(.tint)
-                    VStack(alignment: .leading) {
-                        Text(att.filename)
-                        if let s = att.sizeBytes {
-                            Text(byteString(s))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer()
-                    if let hex = att.sha256Hex {
-                        Text(String(hex.prefix(10)) + "…")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .help(hex)
-                    }
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                AttachmentRow(att: att)
             }
         }
     }
@@ -124,4 +99,73 @@ struct MessageDetailView: View {
     private func byteString(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
+}
+
+private struct AttachmentRow: View {
+    @Environment(MailViewModel.self) private var model
+    let att: AttachmentRef
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading) {
+                Text(att.filename)
+                if let s = att.sizeBytes {
+                    Text(ByteCountFormatter.string(fromByteCount: s, countStyle: .file))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if let hex = att.sha256Hex {
+                Text(String(hex.prefix(10)) + "…")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .help(hex)
+            }
+            #if canImport(AppKit)
+            Button("Open") {
+                Task { await openAttachment() }
+            }
+            .buttonStyle(.borderless)
+            Button("Save…") {
+                Task { await saveAttachment() }
+            }
+            .buttonStyle(.borderless)
+            #endif
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var icon: String {
+        let mime = (att.mimeType ?? "").lowercased()
+        if mime.hasPrefix("image/") { return "photo" }
+        if mime.hasPrefix("video/") { return "film" }
+        if mime.hasPrefix("audio/") { return "waveform" }
+        if mime.contains("pdf")     { return "doc.richtext" }
+        if mime.contains("zip")     { return "archivebox" }
+        return "doc"
+    }
+
+    #if canImport(AppKit)
+    @MainActor
+    private func openAttachment() async {
+        guard let hex = att.sha256Hex,
+              let store = model.store,
+              let data = await store.loadAttachmentData(sha256Hex: hex)
+        else { return }
+        AttachmentActions.open(data: data, filename: att.filename)
+    }
+
+    @MainActor
+    private func saveAttachment() async {
+        guard let hex = att.sha256Hex,
+              let store = model.store,
+              let data = await store.loadAttachmentData(sha256Hex: hex)
+        else { return }
+        AttachmentActions.saveAs(data: data, suggestedName: att.filename)
+    }
+    #endif
 }
