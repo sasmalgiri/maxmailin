@@ -39,7 +39,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 5
+    private static let schemaVersion: Int64 = 6
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -235,6 +235,17 @@ public actor MailStore {
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '5');")
             }
         }
+
+        if current < 6 {
+            try conn.transaction {
+                let cols = try Self.columnsOf("attachments", in: conn)
+                if !cols.contains("external_id") {
+                    try conn.exec("ALTER TABLE attachments ADD COLUMN external_id TEXT;")
+                }
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_attachments_external_id ON attachments(external_id);")
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '6');")
+            }
+        }
     }
 
     private static func columnsOf(_ table: String, in conn: SQLiteConnection) throws -> Set<String> {
@@ -395,8 +406,8 @@ public actor MailStore {
             """)
             self.insBody = try conn.prepare("INSERT INTO message_bodies(message_id, plain_body, html_body) VALUES(?, ?, ?);")
             self.insAtt = try conn.prepare("""
-            INSERT INTO attachments(message_id, filename, mime_type, size_bytes, sha256)
-            VALUES(?, ?, ?, ?, ?);
+            INSERT INTO attachments(message_id, filename, mime_type, size_bytes, sha256, external_id)
+            VALUES(?, ?, ?, ?, ?, ?);
             """)
             self.selFolderID = try conn.prepare("SELECT id FROM folders WHERE account_id = ? AND path = ?;")
             self.insFolder = try conn.prepare("INSERT INTO folders(account_id, path) VALUES(?, ?) RETURNING id;")
@@ -461,8 +472,12 @@ public actor MailStore {
                 try stmts.insAtt.bind(1, newID)
                 try stmts.insAtt.bind(2, att.filename)
                 try stmts.insAtt.bind(3, att.mimeType)
-                try stmts.insAtt.bind(4, attSizes[i][j])
+                // Prefer the size of the actual blob bytes we wrote; fall
+                // back to the caller-supplied hint (e.g., JMAP's reported size)
+                // so attachment list rows still show size without bytes.
+                try stmts.insAtt.bind(4, attSizes[i][j] ?? att.sizeHint)
                 try stmts.insAtt.bind(5, attHashes[i][j])
+                try stmts.insAtt.bind(6, att.externalID)
                 try stmts.insAtt.run()
             }
 
@@ -691,7 +706,7 @@ public actor MailStore {
     /// Attachment metadata for a message — does not load blob bytes.
     public func attachments(messageRowID: Int64) throws -> [AttachmentRef] {
         let stmt = try conn.prepare("""
-        SELECT id, message_id, filename, mime_type, size_bytes, sha256
+        SELECT id, message_id, filename, mime_type, size_bytes, sha256, external_id
           FROM attachments
          WHERE message_id = ?
          ORDER BY id ASC;
@@ -705,11 +720,48 @@ public actor MailStore {
                 filename: row.string(2) ?? "",
                 mimeType: row.string(3),
                 sizeBytes: row.isNull(4) ? nil : row.int64(4),
-                sha256Hex: row.string(5)
+                sha256Hex: row.string(5),
+                externalID: row.string(6)
             ))
             return true
         }
         return out
+    }
+
+    /// Find an attachment row by its id. Used by JMAP attachment download
+    /// to look up the externalID + filename for the fetch.
+    public func attachment(id attachmentID: Int64) throws -> AttachmentRef? {
+        let stmt = try conn.prepare("""
+        SELECT id, message_id, filename, mime_type, size_bytes, sha256, external_id
+          FROM attachments WHERE id = ?;
+        """)
+        try stmt.bind(1, attachmentID)
+        var result: AttachmentRef?
+        try stmt.forEachRow { row in
+            result = AttachmentRef(
+                id: row.int64(0),
+                messageRowID: row.int64(1),
+                filename: row.string(2) ?? "",
+                mimeType: row.string(3),
+                sizeBytes: row.isNull(4) ? nil : row.int64(4),
+                sha256Hex: row.string(5),
+                externalID: row.string(6)
+            )
+            return false
+        }
+        return result
+    }
+
+    /// Fill in the sha256 + size on an existing attachment row once the bytes
+    /// have been downloaded and persisted to the BlobStore.
+    public func setAttachmentBlob(attachmentID: Int64, sha256Hex: String, sizeBytes: Int64) throws {
+        let stmt = try conn.prepare("""
+        UPDATE attachments SET sha256 = ?, size_bytes = ? WHERE id = ?;
+        """)
+        try stmt.bind(1, sha256Hex)
+        try stmt.bind(2, sizeBytes)
+        try stmt.bind(3, attachmentID)
+        try stmt.run()
     }
 
     /// Load attachment bytes by its SHA-256 reference.

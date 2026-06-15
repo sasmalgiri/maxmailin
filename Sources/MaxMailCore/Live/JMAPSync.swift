@@ -86,7 +86,7 @@ public actor JMAPSync {
                     "id", "messageId", "inReplyTo", "references", "subject",
                     "from", "to", "cc", "receivedAt", "size", "keywords",
                     "hasAttachment", "preview", "textBody", "htmlBody",
-                    "bodyValues"
+                    "bodyValues", "attachments"
                 ],
                 "fetchTextBodyValues": true,
                 "fetchHTMLBodyValues": true,
@@ -234,6 +234,50 @@ public actor JMAPSync {
 
         try await store.setSyncState(accountID: localAccountID, scope: scopeKey, state: newState)
         return (addedCount, updatedCount, removedCount)
+    }
+
+    // MARK: - Attachment download
+
+    /// Pull the blob bytes for one attachment via the session's downloadUrl
+    /// template, store them in the MailStore BlobStore (content-addressed,
+    /// so identical attachments across messages collapse to one file), and
+    /// patch the attachments row with the new sha256 + actual size.
+    /// Returns the AttachmentRef with sha256 populated.
+    @discardableResult
+    public func downloadAttachment(attachmentID: Int64) async throws -> AttachmentRef {
+        guard let row = try await store.attachment(id: attachmentID) else {
+            throw JMAPError.invalidResponse("no attachment row \(attachmentID)")
+        }
+        if row.hasLocalBlob { return row }   // already have it
+        guard let externalID = row.externalID else {
+            throw JMAPError.invalidResponse("attachment \(attachmentID) has no JMAP blobId")
+        }
+        // Need the JMAP accountId. We pull it from the per-message JMAP map
+        // — the attachment belongs to the message identified by row.messageRowID.
+        guard let mapping = try await store.jmapEmailID(forLocalRowID: row.messageRowID) else {
+            throw JMAPError.invalidResponse("attachment \(attachmentID) is not on a JMAP-synced message")
+        }
+        let data = try await client.downloadBlob(
+            accountID: mapping.jmapAccountID,
+            blobID: externalID,
+            mimeType: row.mimeType ?? "application/octet-stream",
+            filename: row.filename
+        )
+        let hex = try await store.blobStore.put(data)
+        try await store.setAttachmentBlob(
+            attachmentID: attachmentID,
+            sha256Hex: hex,
+            sizeBytes: Int64(data.count)
+        )
+        return AttachmentRef(
+            id: row.id,
+            messageRowID: row.messageRowID,
+            filename: row.filename,
+            mimeType: row.mimeType,
+            sizeBytes: Int64(data.count),
+            sha256Hex: hex,
+            externalID: row.externalID
+        )
     }
 
     // MARK: - Flag writes
@@ -465,6 +509,26 @@ public actor JMAPSync {
                         ?? (email["preview"] as? String)
         let htmlBody = htmlPartIDs.compactMap { bodyValues[$0]?["value"] as? String }.first
 
+        // JMAP attachments come through as a flat list of part metadata —
+        // we keep filename/mime/size and store the blobId as externalID so
+        // downloadAttachment can fetch the bytes later via downloadUrl.
+        var attachments: [AttachmentIn] = []
+        if let arr = email["attachments"] as? [[String: Any]] {
+            for entry in arr {
+                let name = (entry["name"] as? String) ?? "attachment.bin"
+                let mime = entry["type"] as? String
+                let blobID = entry["blobId"] as? String
+                let size = entry["size"] as? Int
+                attachments.append(AttachmentIn(
+                    filename: name,
+                    mimeType: mime,
+                    data: nil,
+                    externalID: blobID,
+                    sizeHint: size.map(Int64.init)
+                ))
+            }
+        }
+
         return IngestMessage(
             accountID: localAccountID,
             folder: folder,
@@ -480,7 +544,7 @@ public actor JMAPSync {
             flags: flags,
             plainBody: plainBody,
             htmlBody: htmlBody,
-            attachments: []   // JMAP attachments via Email/get downloadUrl come in 3A.2
+            attachments: attachments
         )
     }
 

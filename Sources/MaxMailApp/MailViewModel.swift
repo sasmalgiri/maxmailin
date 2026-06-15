@@ -42,6 +42,11 @@ final class MailViewModel {
     var showImportPicker: Bool = false
 
     var showAnalytics: Bool = false
+    var showCompose: Bool = false
+    var showJMAPSettings: Bool = false
+    var isSending: Bool = false
+    var sendStatus: String = ""
+    var sendError: String?
     var isBackgroundAnalyzing: Bool = false
     var analyticsProgress: AnalysisProgress = AnalysisProgress(analyzed: 0, total: 0)
     var analyticsDistribution: SentimentDistribution = SentimentDistribution(
@@ -231,6 +236,66 @@ final class MailViewModel {
         await analyzer?.cancel()
         isBackgroundAnalyzing = false
         await refreshAnalytics()
+    }
+
+    // MARK: - Compose + send
+
+    /// Send a plain-text email through the saved JMAP config. Returns the
+    /// server-assigned email id on success, or nil if anything failed —
+    /// in which case `sendError` carries the user-visible message.
+    func sendMail(from sender: String, to: [String], subject: String, body: String) async -> String? {
+        sendError = nil
+        guard !to.isEmpty else { sendError = "No recipients"; return nil }
+        guard let cfg = JMAPConfigStore.first(),
+              let url = URL(string: cfg.sessionURL) else {
+            sendError = "No JMAP account configured"
+            return nil
+        }
+        guard let store else { sendError = "Store not ready"; return nil }
+        isSending = true
+        sendStatus = "Connecting…"
+        defer { isSending = false }
+        do {
+            let client = JMAPClient(config: .init(sessionURL: url,
+                                                  credential: .bearer(cfg.bearerToken)))
+            let accID = try await store.upsertAccount(
+                name: cfg.displayName, address: sender, kind: "jmap"
+            )
+            let sync = JMAPSync(client: client, store: store, localAccountID: accID)
+            sendStatus = "Sending…"
+            let id = try await sync.sendPlainEmail(
+                from: sender, to: to, subject: subject, body: body
+            )
+            sendStatus = "Sent."
+            return id
+        } catch {
+            sendError = error.localizedDescription
+            return nil
+        }
+    }
+
+    // MARK: - Attachment download
+
+    func downloadAttachment(_ ref: AttachmentRef) async {
+        guard let store else { return }
+        guard let cfg = JMAPConfigStore.first(),
+              let url = URL(string: cfg.sessionURL) else {
+            errorMessage = "No JMAP account configured for download"
+            return
+        }
+        guard let acc = selectedAccount else { return }
+        do {
+            let client = JMAPClient(config: .init(sessionURL: url,
+                                                  credential: .bearer(cfg.bearerToken)))
+            let sync = JMAPSync(client: client, store: store, localAccountID: acc.id)
+            let updated = try await sync.downloadAttachment(attachmentID: ref.id)
+            // Reflect locally — replace in current list.
+            if let idx = currentAttachments.firstIndex(where: { $0.id == ref.id }) {
+                currentAttachments[idx] = updated
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Import

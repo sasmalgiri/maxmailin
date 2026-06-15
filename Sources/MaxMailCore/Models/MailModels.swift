@@ -8,11 +8,23 @@ public struct AttachmentIn: Sendable {
     public let filename: String
     public let mimeType: String?
     public let data: Data?
+    /// Optional provider-specific reference (e.g., JMAP blobId, IMAP UID-section)
+    /// used to download bytes later.
+    public let externalID: String?
+    public let sizeHint: Int64?
 
-    public init(filename: String, mimeType: String? = nil, data: Data? = nil) {
+    public init(
+        filename: String,
+        mimeType: String? = nil,
+        data: Data? = nil,
+        externalID: String? = nil,
+        sizeHint: Int64? = nil
+    ) {
         self.filename = filename
         self.mimeType = mimeType
         self.data = data
+        self.externalID = externalID
+        self.sizeHint = sizeHint
     }
 }
 
@@ -24,6 +36,24 @@ public struct AttachmentRef: Sendable, Identifiable {
     public let mimeType: String?
     public let sizeBytes: Int64?
     public let sha256Hex: String?
+    public let externalID: String?
+
+    public init(
+        id: Int64, messageRowID: Int64, filename: String,
+        mimeType: String?, sizeBytes: Int64?, sha256Hex: String?,
+        externalID: String? = nil
+    ) {
+        self.id = id
+        self.messageRowID = messageRowID
+        self.filename = filename
+        self.mimeType = mimeType
+        self.sizeBytes = sizeBytes
+        self.sha256Hex = sha256Hex
+        self.externalID = externalID
+    }
+
+    /// True when we have the bytes locally already.
+    public var hasLocalBlob: Bool { sha256Hex != nil }
 }
 
 /// A parsed message ready to be ingested into the store.

@@ -449,6 +449,124 @@ final class JMAPTests: XCTestCase {
         XCTAssertEqual(methodNames, ["Email/set", "EmailSubmission/set"])
     }
 
+    // MARK: - Attachment download
+
+    func testDownloadAttachmentFetchesBlobAndPatchesRow() async throws {
+        // Override the stub for this test to also handle GET requests:
+        // any non-POST will be answered with the configured attachment bytes
+        // so the download path is exercised end-to-end.
+        StubProtocol.sessionJSON = Data("""
+        {
+          "username":"a@x","apiUrl":"https://x.example/api/",
+          "downloadUrl":"https://x.example/dl/{accountId}/{blobId}/{type}/{name}",
+          "uploadUrl":"https://x.example/up/",
+          "accounts":{"A1":{"name":"a","isPersonal":true,"isReadOnly":false}},
+          "primaryAccounts":{"urn:ietf:params:jmap:mail":"A1"}
+        }
+        """.utf8)
+        // Initial Email/query + Email/get returns one email with one attachment.
+        StubProtocol.postQueue = [
+            Data("""
+            {"methodResponses":[
+              ["Email/query", {"ids":["E1"], "accountId":"A1"}, "q"],
+              ["Email/get", {"state":"S1","list":[
+                {"id":"E1","messageId":["m1@x"],"subject":"with attachment",
+                 "from":[{"email":"a@x"}],"to":[{"email":"b@x"}],
+                 "receivedAt":"2026-04-01T12:00:00Z","size":2048,
+                 "keywords":{},"hasAttachment":true,
+                 "textBody":[{"partId":"P1"}],"htmlBody":[],
+                 "bodyValues":{"P1":{"value":"see attached"}},
+                 "attachments":[
+                   {"partId":"P2","blobId":"BLOB1","size":4,
+                    "name":"hi.bin","type":"application/octet-stream"}
+                 ]}
+              ]}, "g"]
+            ]}
+            """.utf8)
+        ]
+
+        // Stub a separate GET stream for the blob download: we use a tiny
+        // helper subclass so a single test can short-circuit the GET into
+        // 4 bytes ("DATA") instead of routing through sessionJSON.
+        AttachmentByteStub.bytes = Data("DATA".utf8)
+
+        let dbDir = tempDir()
+        let store = try MailStore(url: dbDir.appendingPathComponent("mail.sqlite"))
+        let accID = try await store.upsertAccount(name: "JMAP", address: "a@x", kind: "jmap")
+        let client = makeClientWithByteStub()
+        _ = try await client.discover()
+        let sync = JMAPSync(client: client, store: store, localAccountID: accID)
+
+        _ = try await sync.pullRecent(
+            mailbox: JMAPMailbox(id: "M1", name: "Inbox", role: "inbox",
+                                 totalEmails: 1, unreadEmails: 1),
+            folderName: "INBOX"
+        )
+
+        // The attachment row should already exist with externalID set and
+        // size populated from the JMAP size hint, but no sha256 yet.
+        let local = try await store.localRowID(forJMAPEmailID: "E1")!
+        let attsBefore = try await store.attachments(messageRowID: local)
+        XCTAssertEqual(attsBefore.count, 1)
+        XCTAssertEqual(attsBefore.first?.externalID, "BLOB1")
+        XCTAssertEqual(attsBefore.first?.sizeBytes, 4)
+        XCTAssertNil(attsBefore.first?.sha256Hex)
+
+        // Download the bytes — should write through to BlobStore.
+        let result = try await sync.downloadAttachment(attachmentID: attsBefore.first!.id)
+        XCTAssertEqual(result.sizeBytes, 4)
+        XCTAssertNotNil(result.sha256Hex)
+
+        // Round-trip the bytes via the BlobStore.
+        let raw = await store.loadAttachmentData(sha256Hex: result.sha256Hex!)
+        XCTAssertEqual(raw, Data("DATA".utf8))
+    }
+
+    private func makeClientWithByteStub() -> JMAPClient {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [AttachmentByteStub.self]
+        let session = URLSession(configuration: config)
+        let cfg = JMAPConfig(
+            sessionURL: URL(string: "https://example.com/.well-known/jmap")!,
+            credential: .bearer("fake-token")
+        )
+        return JMAPClient(config: cfg, urlSession: session)
+    }
+
+    /// Variant of StubProtocol that returns `bytes` for any GET request and
+    /// otherwise delegates to the standard postQueue / sessionJSON behavior.
+    final class AttachmentByteStub: URLProtocol, @unchecked Sendable {
+        nonisolated(unsafe) static var bytes: Data = Data()
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            let url = request.url ?? URL(string: "stub://nowhere")!
+            let method = request.httpMethod ?? "GET"
+            let body: Data
+            if method == "GET" && url.path.contains("/dl/") {
+                body = Self.bytes
+            } else if method == "POST" {
+                StubProtocol.lastPostBody = request.bodySteamReadAllData() ?? request.httpBody
+                if !StubProtocol.postQueue.isEmpty {
+                    body = StubProtocol.postQueue.removeFirst()
+                } else {
+                    body = StubProtocol.postJSON
+                }
+            } else {
+                body = StubProtocol.sessionJSON
+            }
+            let resp = HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/octet-stream"]
+            )!
+            client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        override func stopLoading() {}
+    }
+
     // MARK: - Fixtures
 
     private let sessionFixture: Data = Data("""

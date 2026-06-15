@@ -173,7 +173,40 @@ public actor JMAPClient {
         )
     }
 
+    /// Download blob bytes from the session's downloadUrl template.
+    /// Performs `{accountId}` / `{blobId}` / `{type}` / `{name}` substitution
+    /// per RFC 8620 §6.2 and issues an authenticated GET.
+    public func downloadBlob(
+        accountID: String,
+        blobID: String,
+        mimeType: String,
+        filename: String
+    ) async throws -> Data {
+        let sess = try await currentSession()
+        let template = sess.downloadUrl
+        let url = template
+            .replacingOccurrences(of: "{accountId}", with: percentEscape(accountID))
+            .replacingOccurrences(of: "{blobId}",    with: percentEscape(blobID))
+            .replacingOccurrences(of: "{type}",      with: percentEscape(mimeType))
+            .replacingOccurrences(of: "{name}",      with: percentEscape(filename))
+        guard let u = URL(string: url) else {
+            throw JMAPError.invalidResponse("malformed downloadUrl: \(url)")
+        }
+        var req = URLRequest(url: u)
+        req.httpMethod = "GET"
+        applyAuth(to: &req)
+        let (data, resp) = try await urlSession.data(for: req)
+        try validate(resp, data: data)
+        return data
+    }
+
     // MARK: - Helpers
+
+    private func percentEscape(_ s: String) -> String {
+        // RFC 8620 implementations use plain URL-path escaping. Keep the
+        // characters allowed in URL paths intact.
+        s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
+    }
 
     private func applyAuth(to req: inout URLRequest) {
         switch config.credential {

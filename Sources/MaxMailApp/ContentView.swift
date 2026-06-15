@@ -32,6 +32,14 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    model.showCompose = true
+                } label: {
+                    Label("New message", systemImage: "square.and.pencil")
+                }
+                .keyboardShortcut("n", modifiers: [.command])
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     model.showAnalytics = true
                 } label: {
                     Label("Insights", systemImage: "chart.line.uptrend.xyaxis")
@@ -46,9 +54,24 @@ struct ContentView: View {
                 }
                 .disabled(model.isImporting)
             }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    model.showJMAPSettings = true
+                } label: {
+                    Label("JMAP settings", systemImage: "gearshape")
+                }
+            }
         }
         .sheet(isPresented: $bindable.showAnalytics) {
             AnalyticsView()
+                .environment(model)
+        }
+        .sheet(isPresented: $bindable.showCompose) {
+            ComposeView()
+                .environment(model)
+        }
+        .sheet(isPresented: $bindable.showJMAPSettings) {
+            JMAPSettingsView()
                 .environment(model)
         }
         .fileImporter(

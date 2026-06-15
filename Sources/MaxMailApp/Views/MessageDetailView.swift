@@ -132,14 +132,21 @@ private struct AttachmentRow: View {
                     .help(hex)
             }
             #if canImport(AppKit)
-            Button("Open") {
-                Task { await openAttachment() }
+            if att.hasLocalBlob {
+                Button("Open") {
+                    Task { await openAttachment() }
+                }
+                .buttonStyle(.borderless)
+                Button("Save…") {
+                    Task { await saveAttachment() }
+                }
+                .buttonStyle(.borderless)
+            } else if att.externalID != nil {
+                Button("Download") {
+                    Task { await model.downloadAttachment(att) }
+                }
+                .buttonStyle(.borderless)
             }
-            .buttonStyle(.borderless)
-            Button("Save…") {
-                Task { await saveAttachment() }
-            }
-            .buttonStyle(.borderless)
             #endif
         }
         .padding(8)
