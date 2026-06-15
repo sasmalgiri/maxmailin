@@ -10,9 +10,22 @@ final class JMAPTests: XCTestCase {
     /// can assert what the client actually sent.
     final class StubProtocol: URLProtocol, @unchecked Sendable {
         nonisolated(unsafe) static var sessionJSON: Data = Data()
+        /// Fallback POST body — used when the queue is empty.
         nonisolated(unsafe) static var postJSON: Data = Data()
+        /// Queue of POST responses consumed in order. Each test that issues
+        /// multiple POSTs in sequence (e.g., listMailboxes + Identity/get +
+        /// send) enqueues one Data per expected POST.
+        nonisolated(unsafe) static var postQueue: [Data] = []
         nonisolated(unsafe) static var lastPostBody: Data?
         nonisolated(unsafe) static var lastPostHeaders: [String: String] = [:]
+
+        static func reset() {
+            sessionJSON = Data()
+            postJSON = Data()
+            postQueue = []
+            lastPostBody = nil
+            lastPostHeaders = [:]
+        }
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -23,7 +36,11 @@ final class JMAPTests: XCTestCase {
             if method == "POST" {
                 Self.lastPostBody = request.bodySteamReadAllData() ?? request.httpBody
                 Self.lastPostHeaders = request.allHTTPHeaderFields ?? [:]
-                body = Self.postJSON
+                if !Self.postQueue.isEmpty {
+                    body = Self.postQueue.removeFirst()
+                } else {
+                    body = Self.postJSON
+                }
             } else {
                 body = Self.sessionJSON
             }
@@ -36,6 +53,11 @@ final class JMAPTests: XCTestCase {
             client?.urlProtocolDidFinishLoading(self)
         }
         override func stopLoading() {}
+    }
+
+    override func setUp() {
+        super.setUp()
+        StubProtocol.reset()
     }
 
     private func makeClient() -> JMAPClient {
@@ -214,6 +236,217 @@ final class JMAPTests: XCTestCase {
         )
         XCTAssertEqual(n2, 0)
         XCTAssertEqual(skipped2, 2)
+    }
+
+    // MARK: - Incremental sync via Email/changes
+
+    func testSyncIncrementalAppliesAddsUpdatesAndDeletes() async throws {
+        StubProtocol.sessionJSON = sessionFixture
+        // First call: pullRecent seeds two messages + state token "S1".
+        StubProtocol.postJSON = Data("""
+        {
+          "methodResponses": [
+            ["Email/query", {"ids":["E1","E2"], "accountId":"A1"}, "q"],
+            ["Email/get", {"state":"S1","list":[
+              {"id":"E1","messageId":["m1@x"],"subject":"First",
+               "from":[{"email":"a@x"}],"to":[{"email":"b@x"}],
+               "receivedAt":"2026-04-01T12:00:00Z","size":100,
+               "keywords":{},"hasAttachment":false,
+               "textBody":[{"partId":"P1"}],"htmlBody":[],
+               "bodyValues":{"P1":{"value":"first body"}}},
+              {"id":"E2","messageId":["m2@x"],"subject":"Second",
+               "from":[{"email":"c@x"}],"to":[{"email":"d@x"}],
+               "receivedAt":"2026-04-02T12:00:00Z","size":100,
+               "keywords":{},"hasAttachment":false,
+               "textBody":[{"partId":"P1"}],"htmlBody":[],
+               "bodyValues":{"P1":{"value":"second body"}}}
+            ]}, "g"]
+          ],
+          "sessionState":"S0"
+        }
+        """.utf8)
+
+        let dbDir = tempDir()
+        let store = try MailStore(url: dbDir.appendingPathComponent("mail.sqlite"))
+        let accID = try await store.upsertAccount(name: "JMAP", address: "a@x", kind: "jmap")
+        let client = makeClient()
+        _ = try await client.discover()
+        let sync = JMAPSync(client: client, store: store, localAccountID: accID)
+
+        let mailbox = JMAPMailbox(id: "M1", name: "Inbox", role: "inbox",
+                                  totalEmails: 2, unreadEmails: 0)
+        let (added, _) = try await sync.pullRecent(mailbox: mailbox, folderName: "INBOX")
+        XCTAssertEqual(added, 2)
+        let seeded = try await store.syncState(accountID: accID, scope: "email:A1")
+        XCTAssertEqual(seeded, "S1")
+
+        // Capture the row IDs while they still exist for later assertions.
+        let e1Local = try await store.localRowID(forJMAPEmailID: "E1")
+        let e2Local = try await store.localRowID(forJMAPEmailID: "E2")
+        XCTAssertNotNil(e1Local)
+        XCTAssertNotNil(e2Local)
+
+        // Second call: Email/changes returns one create (E3), one update
+        // (E1 now $seen), one destroy (E2). Email/get returns details.
+        StubProtocol.postJSON = Data("""
+        {
+          "methodResponses": [
+            ["Email/changes", {
+              "accountId":"A1",
+              "oldState":"S1","newState":"S2",
+              "hasMoreChanges": false,
+              "created":["E3"],
+              "updated":["E1"],
+              "destroyed":["E2"]
+            }, "c"],
+            ["Email/get", {"state":"S2","list":[
+              {"id":"E3","messageId":["m3@x"],"subject":"Third",
+               "from":[{"email":"e@x"}],"to":[{"email":"f@x"}],
+               "receivedAt":"2026-04-03T12:00:00Z","size":100,
+               "keywords":{"$flagged":true},"hasAttachment":false,
+               "textBody":[{"partId":"P1"}],"htmlBody":[],
+               "bodyValues":{"P1":{"value":"third body"}}}
+            ]}, "gnew"],
+            ["Email/get", {"state":"S2","list":[
+              {"id":"E1","keywords":{"$seen":true}}
+            ]}, "gupd"]
+          ],
+          "sessionState":"S2"
+        }
+        """.utf8)
+
+        let result = try await sync.syncIncremental(mailboxHint: mailbox, folderName: "INBOX")
+        XCTAssertEqual(result.added, 1)
+        XCTAssertEqual(result.updated, 1)
+        XCTAssertEqual(result.removed, 1)
+
+        // E2 should be gone.
+        let e2After = try await store.localRowID(forJMAPEmailID: "E2")
+        XCTAssertNil(e2After)
+        // E1's flags should now include .seen.
+        let e1Flags = try await store.messageFlags(messageRowID: e1Local!)
+        XCTAssertTrue(e1Flags?.contains(.seen) == true)
+        // E3 should now exist + be linked.
+        let e3Local = try await store.localRowID(forJMAPEmailID: "E3")
+        XCTAssertNotNil(e3Local)
+        // Sync state should advance.
+        let advanced = try await store.syncState(accountID: accID, scope: "email:A1")
+        XCTAssertEqual(advanced, "S2")
+    }
+
+    // MARK: - Flag writes
+
+    func testSetSeenSendsEmailSetAndUpdatesLocalFlags() async throws {
+        StubProtocol.sessionJSON = sessionFixture
+        StubProtocol.postJSON = Data("""
+        {
+          "methodResponses": [
+            ["Email/query", {"ids":["E1"], "accountId":"A1"}, "q"],
+            ["Email/get", {"state":"S1","list":[
+              {"id":"E1","messageId":["m1@x"],"subject":"Only",
+               "from":[{"email":"a@x"}],"to":[{"email":"b@x"}],
+               "receivedAt":"2026-04-01T12:00:00Z","size":100,
+               "keywords":{},"hasAttachment":false,
+               "textBody":[{"partId":"P1"}],"htmlBody":[],
+               "bodyValues":{"P1":{"value":"body"}}}
+            ]}, "g"]
+          ]
+        }
+        """.utf8)
+
+        let dbDir = tempDir()
+        let store = try MailStore(url: dbDir.appendingPathComponent("mail.sqlite"))
+        let accID = try await store.upsertAccount(name: "JMAP", address: "a@x", kind: "jmap")
+        let client = makeClient()
+        _ = try await client.discover()
+        let sync = JMAPSync(client: client, store: store, localAccountID: accID)
+        _ = try await sync.pullRecent(
+            mailbox: JMAPMailbox(id: "M1", name: "Inbox", role: "inbox",
+                                 totalEmails: 1, unreadEmails: 1),
+            folderName: "INBOX"
+        )
+        let local = try await store.localRowID(forJMAPEmailID: "E1")!
+
+        // Server confirms the update.
+        StubProtocol.postJSON = Data("""
+        {
+          "methodResponses": [
+            ["Email/set", {"accountId":"A1","updated":{"E1":null}}, "u"]
+          ]
+        }
+        """.utf8)
+
+        try await sync.setSeen(localRowID: local, true)
+
+        // Verify the body we sent really was a keywords/$seen=true update.
+        guard let body = StubProtocol.lastPostBody,
+              let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let calls = obj["methodCalls"] as? [[Any]] else {
+            XCTFail("missing or malformed POST"); return
+        }
+        XCTAssertEqual(calls.first?[0] as? String, "Email/set")
+        let args = calls.first?[1] as? [String: Any]
+        let update = args?["update"] as? [String: [String: Any]]
+        let perEmail = update?["E1"]
+        XCTAssertEqual(perEmail?["keywords/$seen"] as? Bool, true)
+
+        // Local flags reflect the new state.
+        let flags = try await store.messageFlags(messageRowID: local)
+        XCTAssertTrue(flags?.contains(.seen) == true)
+    }
+
+    // MARK: - Send (Email/set + EmailSubmission/set)
+
+    func testSendPlainEmailIssuesCorrectMethodCalls() async throws {
+        StubProtocol.sessionJSON = sessionFixture
+        // sendPlainEmail makes three POSTs in sequence:
+        //   1. Mailbox/get          — find Drafts
+        //   2. Identity/get         — find first identity
+        //   3. Email/set + EmailSubmission/set — create draft and submit
+        StubProtocol.postQueue = [
+            Data("""
+            {"methodResponses":[["Mailbox/get",{"list":[
+              {"id":"M_DRAFT","name":"Drafts","role":"drafts","totalEmails":0,"unreadEmails":0}
+            ]}, "0"]]}
+            """.utf8),
+            Data("""
+            {"methodResponses":[["Identity/get",
+              {"list":[{"id":"ID1","email":"alice@example.com"}]}, "i"]]}
+            """.utf8),
+            Data("""
+            {"methodResponses":[
+              ["Email/set", {"accountId":"A1","created":{"draft":{"id":"E_NEW"}}}, "draft"],
+              ["EmailSubmission/set", {"accountId":"A1","created":{"sub":{"id":"SUB1"}}}, "submit"]
+            ]}
+            """.utf8)
+        ]
+
+        let dbDir = tempDir()
+        let store = try MailStore(url: dbDir.appendingPathComponent("mail.sqlite"))
+        let accID = try await store.upsertAccount(name: "JMAP", address: "a@x", kind: "jmap")
+        let client = makeClient()
+        _ = try await client.discover()
+        let sync = JMAPSync(client: client, store: store, localAccountID: accID)
+
+        let emailID = try await sync.sendPlainEmail(
+            from: "alice@example.com",
+            to: ["bob@example.com"],
+            subject: "Hello",
+            body: "This is the body."
+        )
+        XCTAssertEqual(emailID, "E_NEW")
+
+        // Last POST is the send round-trip — verify the using[] includes the
+        // submission capability so the server actually accepts the call.
+        guard let body = StubProtocol.lastPostBody,
+              let obj  = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let using = obj["using"] as? [String],
+              let calls = obj["methodCalls"] as? [[Any]] else {
+            XCTFail("missing POST"); return
+        }
+        XCTAssertTrue(using.contains("urn:ietf:params:jmap:submission"))
+        let methodNames = calls.compactMap { $0.first as? String }
+        XCTAssertEqual(methodNames, ["Email/set", "EmailSubmission/set"])
     }
 
     // MARK: - Fixtures

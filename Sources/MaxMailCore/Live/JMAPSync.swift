@@ -98,16 +98,311 @@ public actor JMAPSync {
               let emails = getArgs["list"] as? [[String: Any]]
         else { throw JMAPError.invalidResponse("Email/get missing list") }
 
+        // Seed the sync cursor so a subsequent syncIncremental can run
+        // Email/changes from this point forward.
+        if let newState = getArgs["state"] as? String {
+            try await store.setSyncState(
+                accountID: localAccountID,
+                scope: "email:\(jmapAccountID)",
+                state: newState
+            )
+        }
+
         let resolvedFolder = folderName ?? mailbox.name
-        var batch: [IngestMessage] = []
-        batch.reserveCapacity(emails.count)
+        var ingested = 0
+        var skipped  = 0
         for entry in emails {
-            if let msg = ingestMessage(from: entry, folder: resolvedFolder) {
-                batch.append(msg)
+            guard let msg = ingestMessage(from: entry, folder: resolvedFolder),
+                  let jmapEmailID = entry["id"] as? String else { continue }
+            // Check if the RFC 5322 Message-ID already exists; ingest() is
+            // idempotent on that key, so a pre-existing row means "skipped".
+            let preExisting = try await store.lookupMessageRowID(
+                accountID: localAccountID, messageID: msg.messageID
+            )
+            let rowID = try await store.ingest(msg)
+            if preExisting == nil { ingested += 1 } else { skipped += 1 }
+            try await store.linkJMAP(
+                localRowID: rowID,
+                jmapAccountID: jmapAccountID,
+                jmapEmailID: jmapEmailID
+            )
+        }
+        return (ingested, skipped)
+    }
+
+    /// Incremental sync via JMAP Email/changes. Reuses the per-account state
+    /// token stored on the local MailStore. If no token is present yet, the
+    /// caller should run pullRecent first to seed a baseline.
+    ///
+    /// Returns counts for each change category. Created entries are pulled
+    /// fully (headers + body); updated entries are reduced to keyword diffs
+    /// for now (which covers read/star/answer); destroyed entries are deleted
+    /// locally.
+    @discardableResult
+    public func syncIncremental(
+        mailboxHint: JMAPMailbox? = nil,
+        folderName: String? = nil,
+        maxChanges: Int = 200
+    ) async throws -> (added: Int, updated: Int, removed: Int) {
+        let session = try await client.currentSession()
+        guard let jmapAccountID = session.primaryMailAccountID else {
+            throw JMAPError.invalidResponse("session has no primary mail account")
+        }
+        let scopeKey = "email:\(jmapAccountID)"
+        guard let sinceState = try await store.syncState(
+            accountID: localAccountID, scope: scopeKey
+        ) else {
+            // No baseline yet — caller should have called pullRecent first.
+            throw JMAPError.invalidResponse("no JMAP sync state; run pullRecent first")
+        }
+
+        let result = try await client.invoke(methodCalls: [
+            ["Email/changes", [
+                "accountId":  jmapAccountID,
+                "sinceState": sinceState,
+                "maxChanges": maxChanges
+            ], "c"],
+            ["Email/get", [
+                "accountId": jmapAccountID,
+                "#ids": ["resultOf": "c", "name": "Email/changes", "path": "/created"],
+                "properties": [
+                    "id", "messageId", "inReplyTo", "references", "subject",
+                    "from", "to", "cc", "receivedAt", "size", "keywords",
+                    "hasAttachment", "preview", "textBody", "htmlBody",
+                    "bodyValues"
+                ],
+                "fetchTextBodyValues": true,
+                "fetchHTMLBodyValues": true,
+                "maxBodyValueBytes": 1_048_576
+            ], "gnew"],
+            ["Email/get", [
+                "accountId": jmapAccountID,
+                "#ids": ["resultOf": "c", "name": "Email/changes", "path": "/updated"],
+                "properties": ["id", "keywords"]
+            ], "gupd"]
+        ])
+
+        guard let changes = result.first(method: "Email/changes", callID: "c") else {
+            throw JMAPError.invalidResponse("missing Email/changes result")
+        }
+        let newState   = (changes["newState"]  as? String) ?? sinceState
+        let created    = (changes["created"]   as? [String]) ?? []
+        let updated    = (changes["updated"]   as? [String]) ?? []
+        let destroyed  = (changes["destroyed"] as? [String]) ?? []
+
+        // Process creates
+        var addedCount = 0
+        if !created.isEmpty,
+           let newArgs = result.first(method: "Email/get", callID: "gnew"),
+           let newList = newArgs["list"] as? [[String: Any]] {
+            let resolvedFolder = folderName ?? (mailboxHint?.name ?? "INBOX")
+            for entry in newList {
+                guard let msg = ingestMessage(from: entry, folder: resolvedFolder),
+                      let jmapEmailID = entry["id"] as? String else { continue }
+                let rowID = try await store.ingest(msg)
+                try await store.linkJMAP(
+                    localRowID: rowID,
+                    jmapAccountID: jmapAccountID,
+                    jmapEmailID: jmapEmailID
+                )
+                addedCount += 1
             }
         }
-        let inserted = try await store.bulkIngest(batch)
-        return (inserted, batch.count - inserted)
+
+        // Process keyword updates
+        var updatedCount = 0
+        if !updated.isEmpty,
+           let updArgs = result.first(method: "Email/get", callID: "gupd"),
+           let updList = updArgs["list"] as? [[String: Any]] {
+            for entry in updList {
+                guard let jid = entry["id"] as? String,
+                      let kws = entry["keywords"] as? [String: Bool] else { continue }
+                guard let localID = try await store.localRowID(forJMAPEmailID: jid) else { continue }
+                let new = Self.flags(from: kws)
+                try await store.updateMessageFlags(messageRowID: localID, flags: new)
+                updatedCount += 1
+            }
+        }
+
+        // Process destroys
+        var removedCount = 0
+        for jid in destroyed {
+            guard let localID = try await store.localRowID(forJMAPEmailID: jid) else { continue }
+            try await store.deleteMessage(messageRowID: localID)
+            removedCount += 1
+        }
+
+        try await store.setSyncState(accountID: localAccountID, scope: scopeKey, state: newState)
+        return (addedCount, updatedCount, removedCount)
+    }
+
+    // MARK: - Flag writes
+
+    /// Toggle a single JMAP keyword on a message. The server response is the
+    /// source of truth — we only update local flags when the update is
+    /// confirmed in Email/set.updated.
+    public func setKeyword(localRowID: Int64, keyword: String, value: Bool) async throws {
+        guard let mapping = try await store.jmapEmailID(forLocalRowID: localRowID) else {
+            throw JMAPError.invalidResponse("local row \(localRowID) has no JMAP id")
+        }
+        // JMAP patch syntax: `keywords/$seen` is the keyword pointer; the
+        // value is either true (set) or null (unset). Foundation can't encode
+        // NSNull through JSONSerialization safely without a placeholder type,
+        // so we send NSNull() which JSONSerialization renders as JSON null.
+        let updateValue: Any = value ? true : NSNull()
+        let result = try await client.invoke(methodCalls: [
+            ["Email/set", [
+                "accountId": mapping.jmapAccountID,
+                "update": [
+                    mapping.jmapEmailID: [
+                        "keywords/\(keyword)": updateValue
+                    ]
+                ]
+            ], "u"]
+        ])
+        guard let args = result.first(method: "Email/set", callID: "u") else {
+            throw JMAPError.methodError("no Email/set response")
+        }
+        if let notUpdated = args["notUpdated"] as? [String: Any],
+           let err = notUpdated[mapping.jmapEmailID] {
+            throw JMAPError.methodError("Email/set rejected update: \(err)")
+        }
+        // Reflect locally.
+        if var current = try await store.messageFlags(messageRowID: localRowID),
+           let bit = Self.localFlag(forKeyword: keyword) {
+            if value { current.insert(bit) } else { current.remove(bit) }
+            try await store.updateMessageFlags(messageRowID: localRowID, flags: current)
+        }
+    }
+
+    public func setSeen(localRowID: Int64, _ seen: Bool) async throws {
+        try await setKeyword(localRowID: localRowID, keyword: "$seen", value: seen)
+    }
+
+    public func setFlagged(localRowID: Int64, _ flagged: Bool) async throws {
+        try await setKeyword(localRowID: localRowID, keyword: "$flagged", value: flagged)
+    }
+
+    // MARK: - Compose / send
+
+    /// Minimal Email/set + EmailSubmission/set round-trip. The server picks
+    /// the first identity it advertises for the account. Returns the created
+    /// JMAP email id so callers can link / track delivery later.
+    public func sendPlainEmail(
+        from sender: String,
+        to recipients: [String],
+        subject: String,
+        body: String
+    ) async throws -> String {
+        let session = try await client.currentSession()
+        guard let jmapAccountID = session.primaryMailAccountID else {
+            throw JMAPError.invalidResponse("session has no primary mail account")
+        }
+        // Find Drafts mailbox + first identity.
+        let boxes = try await listMailboxes()
+        guard let drafts = boxes.first(where: { $0.role == "drafts" }) else {
+            throw JMAPError.invalidResponse("no drafts mailbox on JMAP account")
+        }
+        let identityResult = try await client.invoke(
+            using: [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:submission"
+            ],
+            methodCalls: [
+                ["Identity/get", ["accountId": jmapAccountID], "i"]
+            ]
+        )
+        guard let idArgs = identityResult.first(method: "Identity/get", callID: "i"),
+              let idList = idArgs["list"] as? [[String: Any]],
+              let identity = idList.first,
+              let identityID = identity["id"] as? String else {
+            throw JMAPError.invalidResponse("JMAP account has no Identity")
+        }
+
+        let draftKey = "draft"
+        let bodyPartID = "body1"
+        let toList: [[String: String]] = recipients.map { ["email": $0] }
+
+        let createDraft: [String: Any] = [
+            "accountId": jmapAccountID,
+            "create": [
+                draftKey: [
+                    "mailboxIds": [drafts.id: true],
+                    "keywords":   ["$draft": true],
+                    "from":       [["email": sender]],
+                    "to":         toList,
+                    "subject":    subject,
+                    "bodyValues": [bodyPartID: ["value": body]],
+                    "textBody":   [["partId": bodyPartID, "type": "text/plain"]]
+                ]
+            ]
+        ]
+        let submission: [String: Any] = [
+            "accountId": jmapAccountID,
+            "create": [
+                "sub": [
+                    "identityId": identityID,
+                    "emailId":    "#\(draftKey)",
+                    "envelope": [
+                        "mailFrom": ["email": sender],
+                        "rcptTo":   toList
+                    ]
+                ]
+            ],
+            "onSuccessUpdateEmail": [
+                "#sub": [
+                    "keywords/$draft": NSNull(),
+                    "keywords/$seen":  true
+                ]
+            ]
+        ]
+
+        let result = try await client.invoke(
+            using: [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:mail",
+                "urn:ietf:params:jmap:submission"
+            ],
+            methodCalls: [
+                ["Email/set",            createDraft, "draft"],
+                ["EmailSubmission/set",  submission,  "submit"]
+            ]
+        )
+
+        guard let setArgs = result.first(method: "Email/set", callID: "draft"),
+              let created = setArgs["created"] as? [String: Any],
+              let draftObj = created[draftKey] as? [String: Any],
+              let emailID = draftObj["id"] as? String else {
+            throw JMAPError.methodError("Email/set did not create draft")
+        }
+        if let subArgs = result.first(method: "EmailSubmission/set", callID: "submit"),
+           let notCreated = subArgs["notCreated"] as? [String: Any],
+           !notCreated.isEmpty {
+            throw JMAPError.methodError("EmailSubmission rejected: \(notCreated)")
+        }
+        return emailID
+    }
+
+    // MARK: - Flag helpers
+
+    /// Convert a JMAP keywords dictionary into local MessageFlags.
+    static func flags(from keywords: [String: Bool]) -> MessageFlags {
+        var f: MessageFlags = []
+        if keywords["$seen"]     == true { f.insert(.seen) }
+        if keywords["$flagged"]  == true { f.insert(.flagged) }
+        if keywords["$answered"] == true { f.insert(.answered) }
+        if keywords["$draft"]    == true { f.insert(.draft) }
+        return f
+    }
+
+    static func localFlag(forKeyword keyword: String) -> MessageFlags? {
+        switch keyword {
+        case "$seen":     return .seen
+        case "$flagged":  return .flagged
+        case "$answered": return .answered
+        case "$draft":    return .draft
+        default:          return nil
+        }
     }
 
     /// Convenience: pull recent mail from every mailbox at once.

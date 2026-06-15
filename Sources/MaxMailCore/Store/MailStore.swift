@@ -39,7 +39,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 4
+    private static let schemaVersion: Int64 = 5
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -202,6 +202,37 @@ public actor MailStore {
                 """)
                 try conn.exec("CREATE INDEX IF NOT EXISTS idx_forensics_phishing_level ON message_forensics(phishing_level);")
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '4');")
+            }
+        }
+
+        if current < 5 {
+            try conn.transaction {
+                // Maps a local message row to the corresponding JMAP id so
+                // we can issue Email/set / Email/changes / Email/get calls
+                // by the JMAP id. Required for flag writes and incremental
+                // sync once we know an account is a JMAP one.
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS jmap_message_map (
+                    local_id        INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    jmap_account_id TEXT NOT NULL,
+                    jmap_email_id   TEXT NOT NULL,
+                    UNIQUE(jmap_account_id, jmap_email_id)
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_jmap_map_email_id ON jmap_message_map(jmap_email_id);")
+                // Per-account JMAP sync cursors. `scope` is "email" /
+                // "mailbox" so we can advance them independently after each
+                // Email/changes / Mailbox/changes round-trip.
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS jmap_sync_state (
+                    local_account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    scope            TEXT NOT NULL,
+                    state            TEXT NOT NULL,
+                    updated_at       INTEGER NOT NULL,
+                    PRIMARY KEY(local_account_id, scope)
+                );
+                """)
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '5');")
             }
         }
     }
@@ -481,13 +512,114 @@ public actor MailStore {
         return n
     }
 
-    private func lookupMessageRowID(accountID: Int64, messageID: String) throws -> Int64? {
+    public func lookupMessageRowID(accountID: Int64, messageID: String) throws -> Int64? {
         let stmt = try conn.prepare("SELECT id FROM messages WHERE account_id = ? AND message_id = ?;")
         try stmt.bind(1, accountID)
         try stmt.bind(2, messageID)
         var id: Int64 = 0
         try stmt.forEachRow { row in id = row.int64(0); return false }
         return id == 0 ? nil : id
+    }
+
+    // MARK: - JMAP id mapping + sync state
+
+    public func linkJMAP(localRowID: Int64, jmapAccountID: String, jmapEmailID: String) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO jmap_message_map(local_id, jmap_account_id, jmap_email_id)
+        VALUES(?, ?, ?)
+        ON CONFLICT(local_id) DO UPDATE SET
+            jmap_account_id = excluded.jmap_account_id,
+            jmap_email_id   = excluded.jmap_email_id;
+        """)
+        try stmt.bind(1, localRowID)
+        try stmt.bind(2, jmapAccountID)
+        try stmt.bind(3, jmapEmailID)
+        try stmt.run()
+    }
+
+    public func localRowID(forJMAPEmailID jmapEmailID: String) throws -> Int64? {
+        let stmt = try conn.prepare("SELECT local_id FROM jmap_message_map WHERE jmap_email_id = ?;")
+        try stmt.bind(1, jmapEmailID)
+        var id: Int64 = 0
+        try stmt.forEachRow { row in id = row.int64(0); return false }
+        return id == 0 ? nil : id
+    }
+
+    public func jmapEmailID(forLocalRowID localRowID: Int64) throws -> (jmapAccountID: String, jmapEmailID: String)? {
+        let stmt = try conn.prepare("SELECT jmap_account_id, jmap_email_id FROM jmap_message_map WHERE local_id = ?;")
+        try stmt.bind(1, localRowID)
+        var result: (String, String)?
+        try stmt.forEachRow { row in
+            result = (row.string(0) ?? "", row.string(1) ?? "")
+            return false
+        }
+        return result
+    }
+
+    public func syncState(accountID: Int64, scope: String) throws -> String? {
+        let stmt = try conn.prepare("""
+        SELECT state FROM jmap_sync_state WHERE local_account_id = ? AND scope = ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, scope)
+        var s: String?
+        try stmt.forEachRow { row in s = row.string(0); return false }
+        return s
+    }
+
+    public func setSyncState(accountID: Int64, scope: String, state: String) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO jmap_sync_state(local_account_id, scope, state, updated_at)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(local_account_id, scope) DO UPDATE SET
+            state      = excluded.state,
+            updated_at = excluded.updated_at;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, scope)
+        try stmt.bind(3, state)
+        try stmt.bind(4, Int64(Date().timeIntervalSince1970))
+        try stmt.run()
+    }
+
+    // MARK: - Flag mutation + delete
+
+    public func messageFlags(messageRowID: Int64) throws -> MessageFlags? {
+        let stmt = try conn.prepare("SELECT flags FROM messages WHERE id = ?;")
+        try stmt.bind(1, messageRowID)
+        var flags: MessageFlags?
+        try stmt.forEachRow { row in
+            flags = MessageFlags(rawValue: row.int(0))
+            return false
+        }
+        return flags
+    }
+
+    public func updateMessageFlags(messageRowID: Int64, flags: MessageFlags) throws {
+        let stmt = try conn.prepare("UPDATE messages SET flags = ? WHERE id = ?;")
+        try stmt.bind(1, Int64(flags.rawValue))
+        try stmt.bind(2, messageRowID)
+        try stmt.run()
+    }
+
+    /// Delete a message and let cascading clean up bodies / attachments /
+    /// NLP / forensics / JMAP map rows. FTS rows are cleared by hand because
+    /// SQLite doesn't trigger external FTS5 deletes from foreign keys.
+    public func deleteMessage(messageRowID: Int64) throws {
+        try conn.transaction {
+            let yearStmt = try conn.prepare("""
+            SELECT CAST(strftime('%Y', date_unix, 'unixepoch') AS INTEGER) FROM messages WHERE id = ?;
+            """)
+            try yearStmt.bind(1, messageRowID)
+            var year: Int = 0
+            try yearStmt.forEachRow { row in year = row.int(0); return false }
+            if year > 0 {
+                try conn.exec("DELETE FROM messages_fts_\(year) WHERE rowid = \(messageRowID);")
+            }
+            let del = try conn.prepare("DELETE FROM messages WHERE id = ?;")
+            try del.bind(1, messageRowID)
+            try del.run()
+        }
     }
 
     // MARK: - Reads (paged, never load everything)
