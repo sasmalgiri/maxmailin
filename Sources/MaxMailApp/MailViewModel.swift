@@ -31,6 +31,7 @@ final class MailViewModel {
     var currentAttachments: [AttachmentRef] = []
     var currentNLP: EmailNLP?
     var currentForensics: ForensicResult?
+    var currentAnomalies: [EmailAnomaly] = []
 
     var searchText: String = ""
     var searchResults: [SearchHit] = []
@@ -134,12 +135,15 @@ final class MailViewModel {
         selectedMessageID = rowID
         currentNLP = nil
         currentForensics = nil
+        currentAnomalies = []
         guard let store else { return }
         do {
             let body = try await store.loadBody(messageRowID: rowID)
             let atts = try await store.attachments(messageRowID: rowID)
             self.currentBody = body
             self.currentAttachments = atts
+            // Anomalies are cheap (3 indexed lookups) — compute synchronously.
+            self.currentAnomalies = (try? await store.anomalies(forMessageRowID: rowID)) ?? []
             // Kick off NLP + forensics lazily; selection of *another* message
             // before this completes is fine because we re-check rowID below.
             Task { @MainActor [weak self] in

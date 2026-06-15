@@ -832,6 +832,134 @@ public actor MailStore {
         return allHits
     }
 
+    // MARK: - Anomaly detection (on-demand)
+
+    /// Heuristic flags for a single message. Cheap to evaluate — three
+    /// indexed lookups per call — so it's fine to call as messages are
+    /// opened. See EmailAnomaly for definitions.
+    public func anomalies(forMessageRowID id: Int64) throws -> [EmailAnomaly] {
+        guard let meta = try fetchMessageContext(messageRowID: id) else { return [] }
+        var out: [EmailAnomaly] = []
+
+        // First-time contact: no earlier message from this sender on this account.
+        let priorStmt = try conn.prepare("""
+        SELECT date_unix FROM messages
+         WHERE account_id = ? AND from_addr = ? AND date_unix < ?
+         ORDER BY date_unix DESC LIMIT 1;
+        """)
+        try priorStmt.bind(1, meta.accountID)
+        try priorStmt.bind(2, meta.fromAddr)
+        try priorStmt.bind(3, meta.dateUnix)
+        var priorDate: Int64?
+        try priorStmt.forEachRow { row in priorDate = row.int64(0); return false }
+
+        if priorDate == nil {
+            out.append(EmailAnomaly(
+                kind: .firstTimeContact,
+                messageRowID: id,
+                detail: "First message from \(meta.fromAddr)",
+                severity: .notable
+            ))
+        } else if let last = priorDate {
+            let gap = meta.dateUnix - last
+            let dormantThreshold: Int64 = 90 * 86_400
+            if gap >= dormantThreshold {
+                let days = Int(gap / 86_400)
+                out.append(EmailAnomaly(
+                    kind: .dormantSenderRevival,
+                    messageRowID: id,
+                    detail: "Resurfaced after \(days) days of silence",
+                    severity: gap >= 365 * 86_400 ? .high : .notable
+                ))
+            }
+        }
+
+        // Off-hours arrival: 01:00–04:59 in the user's local time zone.
+        let date = Date(timeIntervalSince1970: TimeInterval(meta.dateUnix))
+        let hour = Calendar.current.component(.hour, from: date)
+        if hour >= 1 && hour < 5 {
+            out.append(EmailAnomaly(
+                kind: .offHoursArrival,
+                messageRowID: id,
+                detail: String(format: "Arrived at %02d:%02d local time", hour,
+                               Calendar.current.component(.minute, from: date)),
+                severity: .info
+            ))
+        }
+
+        return out
+    }
+
+    private struct MessageContext {
+        let accountID: Int64
+        let fromAddr: String
+        let dateUnix: Int64
+    }
+
+    private func fetchMessageContext(messageRowID: Int64) throws -> MessageContext? {
+        let stmt = try conn.prepare("""
+        SELECT account_id, from_addr, date_unix FROM messages WHERE id = ?;
+        """)
+        try stmt.bind(1, messageRowID)
+        var ctx: MessageContext?
+        try stmt.forEachRow { row in
+            ctx = MessageContext(
+                accountID: row.int64(0),
+                fromAddr: row.string(1) ?? "",
+                dateUnix: row.int64(2)
+            )
+            return false
+        }
+        return ctx
+    }
+
+    /// Batch view: every first-time-contact + dormant-revival anomaly raised
+    /// for messages newer than `since` on this account, newest first. Used
+    /// by the Insights dashboard's "Unusual activity" section.
+    public func recentAnomalies(accountID: Int64, since: Date, limit: Int = 50) throws -> [EmailAnomaly] {
+        let cutoff = Int64(since.timeIntervalSince1970)
+        let stmt = try conn.prepare("""
+        SELECT m.id, m.from_addr, m.date_unix,
+               (SELECT MAX(m2.date_unix) FROM messages m2
+                 WHERE m2.account_id = m.account_id
+                   AND m2.from_addr  = m.from_addr
+                   AND m2.date_unix  < m.date_unix) AS prev_date
+          FROM messages m
+         WHERE m.account_id = ? AND m.date_unix > ?
+         ORDER BY m.date_unix DESC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, cutoff)
+        try stmt.bind(3, Int64(limit * 2))   // over-fetch so the trim below has room
+
+        var out: [EmailAnomaly] = []
+        try stmt.forEachRow { row in
+            let id = row.int64(0)
+            let from = row.string(1) ?? ""
+            let date = row.int64(2)
+            let prev: Int64? = row.isNull(3) ? nil : row.int64(3)
+            if prev == nil {
+                out.append(EmailAnomaly(
+                    kind: .firstTimeContact,
+                    messageRowID: id,
+                    detail: "First message from \(from)",
+                    severity: .notable
+                ))
+            } else if let p = prev, date - p >= 90 * 86_400 {
+                let days = Int((date - p) / 86_400)
+                out.append(EmailAnomaly(
+                    kind: .dormantSenderRevival,
+                    messageRowID: id,
+                    detail: "Resurfaced after \(days) days of silence",
+                    severity: (date - p) >= 365 * 86_400 ? .high : .notable
+                ))
+            }
+            return out.count < limit
+        }
+        return out
+    }
+
     // MARK: - Stats
 
     public func stats() throws -> StoreStats {

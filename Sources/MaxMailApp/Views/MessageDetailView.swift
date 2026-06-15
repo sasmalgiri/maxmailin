@@ -15,6 +15,9 @@ struct MessageDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     headerBlock
+                    if !model.currentAnomalies.isEmpty {
+                        AnomalyChipsView(anomalies: model.currentAnomalies)
+                    }
                     if let forensics = model.currentForensics,
                        forensics.phishing.level != .none || !forensics.pii.isEmpty {
                         ForensicInsightsView(result: forensics)
