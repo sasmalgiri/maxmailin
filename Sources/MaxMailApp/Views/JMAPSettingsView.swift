@@ -33,7 +33,7 @@ struct JMAPSettingsView: View {
                 Section("JMAP") {
                     TextField("Session URL", text: $sessionURL)
                     SecureField("Bearer token", text: $bearerToken)
-                    Text("The token is stored in UserDefaults for now — keychain support is on the way.")
+                    Text("The token is held in the system Keychain. macOS may prompt you the first time the app reads it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
