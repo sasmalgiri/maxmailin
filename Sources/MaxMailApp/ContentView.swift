@@ -24,11 +24,30 @@ struct ContentView: View {
                         Text(model.importStatus).font(.caption)
                     }
                     .frame(width: 200)
+                } else if model.isRefreshing {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(model.refreshStatus).font(.caption)
+                    }
                 } else {
                     Text(model.statusMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await model.refreshLiveMail() }
+                } label: {
+                    if model.isRefreshing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .keyboardShortcut("r", modifiers: [.command])
+                .disabled(model.isRefreshing || JMAPConfigStore.first() == nil)
+                .help("Sync with the configured JMAP server")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -74,6 +93,8 @@ struct ContentView: View {
             JMAPSettingsView()
                 .environment(model)
         }
+        .sheet(isPresented: $bindable.showAbout) { AboutView() }
+        .sheet(isPresented: $bindable.showShortcuts) { ShortcutsView() }
         .fileImporter(
             isPresented: $bindable.showImportPicker,
             allowedContentTypes: [.data],

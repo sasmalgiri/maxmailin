@@ -20,6 +20,23 @@ struct MaxMailApp: App {
                     model.requestImport()
                 }
                 .keyboardShortcut("i", modifiers: [.command])
+                Button("Refresh") {
+                    Task { await model.refreshLiveMail() }
+                }
+                .keyboardShortcut("r", modifiers: [.command])
+                .disabled(model.isRefreshing)
+            }
+            CommandGroup(replacing: .appInfo) {
+                Button("About maxmailin") {
+                    model.showAbout = true
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+            }
+            CommandGroup(after: .help) {
+                Button("Keyboard shortcuts") {
+                    model.showShortcuts = true
+                }
+                .keyboardShortcut("?", modifiers: [.command, .shift])
             }
         }
     }

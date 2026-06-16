@@ -1035,6 +1035,31 @@ public actor MailStore {
         return n
     }
 
+    /// Counts of total and unread messages for one folder in one shot.
+    /// `unread` = messages whose flags DO NOT include MessageFlags.seen (1<<0).
+    public func folderCounts(accountID: Int64, folder: String) throws -> (total: Int64, unread: Int64) {
+        let stmt = try conn.prepare("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END)
+          FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE f.account_id = ? AND f.path = ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, folder)
+        var total: Int64 = 0
+        var unread: Int64 = 0
+        try stmt.forEachRow { row in
+            total  = row.int64(0)
+            unread = row.isNull(1) ? 0 : row.int64(1)
+            return false
+        }
+        return (total, unread)
+    }
+
+    public func isJMAPLinked(messageRowID: Int64) throws -> Bool {
+        return try jmapEmailID(forLocalRowID: messageRowID) != nil
+    }
+
     public func checkpoint() throws {
         try conn.exec("PRAGMA wal_checkpoint(TRUNCATE);")
     }

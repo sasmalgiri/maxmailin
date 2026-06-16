@@ -31,10 +31,20 @@ struct SidebarView: View {
                                 Label {
                                     HStack {
                                         Text(folder.path)
+                                            .fontWeight(folder.unread > 0 ? .semibold : .regular)
                                         Spacer()
-                                        Text("\(folder.count)")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                                        if folder.unread > 0 {
+                                            Text("\(folder.unread)")
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.accentColor, in: Capsule())
+                                        } else {
+                                            Text("\(folder.count)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
                                     }
                                 } icon: {
                                     Image(systemName: iconForFolder(folder.path))

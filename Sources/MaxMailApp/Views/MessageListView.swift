@@ -23,6 +23,28 @@ struct MessageListView: View {
             ForEach(model.headers, id: \.id) { header in
                 MessageRow(header: header)
                     .tag(header.id)
+                    .contextMenu {
+                        let isSeen = header.flags.contains(.seen)
+                        Button(isSeen ? "Mark as unread" : "Mark as read") {
+                            Task { await model.toggleSeen(rowID: header.id) }
+                        }
+                        Button(header.flags.contains(.flagged) ? "Unflag" : "Flag") {
+                            Task { await model.toggleFlagged(rowID: header.id) }
+                        }
+                        Divider()
+                        Button("Reply") {
+                            Task {
+                                await model.selectMessage(rowID: header.id)
+                                model.startReply()
+                            }
+                        }
+                        Button("Forward") {
+                            Task {
+                                await model.selectMessage(rowID: header.id)
+                                model.startForward()
+                            }
+                        }
+                    }
             }
         }
         .listStyle(.inset)

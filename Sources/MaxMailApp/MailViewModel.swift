@@ -11,6 +11,7 @@ struct AccountSummary: Identifiable, Hashable {
 struct FolderSummary: Identifiable, Hashable {
     let path: String
     let count: Int64
+    let unread: Int64
     var id: String { path }
 }
 
@@ -56,6 +57,12 @@ final class MailViewModel {
     var draftInReplyTo: String?
     var draftReferences: [String] = []
     var lastSentEmailID: String?
+
+    // Live sync + flag state
+    var isRefreshing: Bool = false
+    var refreshStatus: String = ""
+    var showAbout: Bool = false
+    var showShortcuts: Bool = false
 
     var isBackgroundAnalyzing: Bool = false
     var analyticsProgress: AnalysisProgress = AnalysisProgress(analyzed: 0, total: 0)
@@ -120,8 +127,8 @@ final class MailViewModel {
             let paths = try await store.folders(accountID: acc.id)
             var out: [FolderSummary] = []
             for p in paths {
-                let n = try await store.messageCount(accountID: acc.id, folder: p)
-                out.append(FolderSummary(path: p, count: n))
+                let counts = try await store.folderCounts(accountID: acc.id, folder: p)
+                out.append(FolderSummary(path: p, count: counts.total, unread: counts.unread))
             }
             self.folders = out
             if selectedFolder == nil || !paths.contains(selectedFolder!) {
@@ -424,6 +431,90 @@ final class MailViewModel {
             )
         }
         return nil
+    }
+
+    // MARK: - Live JMAP refresh
+
+    /// Sync against the configured JMAP server. For each known mailbox we
+    /// prefer Email/changes (when a sync-state cursor exists) and fall back
+    /// to pullRecent — which itself seeds the cursor for next time.
+    func refreshLiveMail() async {
+        guard let cfg = JMAPConfigStore.first(),
+              let url = URL(string: cfg.sessionURL),
+              let store else {
+            errorMessage = "No JMAP account configured"
+            return
+        }
+        isRefreshing = true
+        refreshStatus = "Connecting…"
+        defer { isRefreshing = false }
+        do {
+            let client = JMAPClient(config: .init(sessionURL: url,
+                                                  credential: .bearer(cfg.bearerToken)))
+            let accID = try await store.upsertAccount(
+                name: cfg.displayName, address: cfg.senderEmail, kind: "jmap"
+            )
+            let sync = JMAPSync(client: client, store: store, localAccountID: accID)
+            let mailboxes = try await sync.listMailboxes()
+            refreshStatus = "Found \(mailboxes.count) mailboxes…"
+            for box in mailboxes {
+                refreshStatus = "Syncing \(box.name)…"
+                let session = try await client.currentSession()
+                let scope = "email:\(session.primaryMailAccountID ?? "")"
+                if let _ = try await store.syncState(accountID: accID, scope: scope) {
+                    _ = try? await sync.syncIncremental(mailboxHint: box, folderName: box.name)
+                } else {
+                    _ = try? await sync.pullRecent(mailbox: box, folderName: box.name, limit: 200)
+                }
+            }
+            refreshStatus = "Up to date"
+            await refreshAccountsAndFolders()
+            await loadHeaders()
+        } catch {
+            errorMessage = "Sync failed: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Flag mutation
+
+    func toggleSeen(rowID: Int64) async {
+        await applyFlagChange(rowID: rowID, keyword: "$seen") { $0.contains(.seen) ? false : true }
+    }
+
+    func toggleFlagged(rowID: Int64) async {
+        await applyFlagChange(rowID: rowID, keyword: "$flagged") { $0.contains(.flagged) ? false : true }
+    }
+
+    private func applyFlagChange(
+        rowID: Int64,
+        keyword: String,
+        newValue: (MessageFlags) -> Bool
+    ) async {
+        guard let store else { return }
+        do {
+            let current = (try await store.messageFlags(messageRowID: rowID)) ?? []
+            let target = newValue(current)
+            let isLive = try await store.isJMAPLinked(messageRowID: rowID)
+            if isLive,
+               let cfg = JMAPConfigStore.first(),
+               let url = URL(string: cfg.sessionURL) {
+                let client = JMAPClient(config: .init(sessionURL: url,
+                                                      credential: .bearer(cfg.bearerToken)))
+                guard let acc = selectedAccount else { return }
+                let sync = JMAPSync(client: client, store: store, localAccountID: acc.id)
+                try await sync.setKeyword(localRowID: rowID, keyword: keyword, value: target)
+            } else {
+                // Local-only message — just flip the bit locally.
+                let bit: MessageFlags = (keyword == "$seen") ? .seen : .flagged
+                var f = current
+                if target { f.insert(bit) } else { f.remove(bit) }
+                try await store.updateMessageFlags(messageRowID: rowID, flags: f)
+            }
+            await loadHeaders()
+            await loadFolders()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Attachment download
