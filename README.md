@@ -66,12 +66,36 @@ Tests/MaxMailCoreTests/
 
 ## Running the app
 
+Fastest dev loop (SPM debug, no bundle):
+
 ```
-swift run maxmail-app
+make run
+# or:  swift run maxmail-app
+```
+
+Build a proper `.app` bundle (release-optimized + ad-hoc codesigned):
+
+```
+make app
+open build/maxmailin.app
+```
+
+Install into `/Applications`:
+
+```
+make install
 ```
 
 Then use **Import mbox…** in the toolbar (or ⌘I) to bring an archive in.
 The store persists at `~/Library/Application Support/maxmailin/mail.sqlite`.
+
+### Real JMAP account
+
+1. Toolbar → **gear** → enter session URL (e.g. `https://api.fastmail.com/.well-known/jmap`),
+   bearer token, and sender email. Token lives in the system Keychain.
+2. Toolbar → **Refresh** (⌘R) syncs mailboxes via `Email/changes` (or
+   `Email/query` + `Email/get` on first run).
+3. ⌘N to compose, right-click any message to Reply / Forward / mark read.
 
 ## License
 
