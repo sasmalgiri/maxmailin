@@ -65,6 +65,11 @@ final class MailViewModel {
     var analyticsTimeline: [SentimentMonth] = []
     var analyticsKeywords: [KeywordCount] = []
     var analyticsEntities: [EntityCount] = []
+    var analyticsSenders: [SenderStat] = []
+
+    var selectedSender: SenderStat?
+    var selectedSenderMessages: [MessageHeader] = []
+    var showSenderDetail: Bool = false
 
     private var analyzer: BackgroundAnalyzer?
 
@@ -206,6 +211,21 @@ final class MailViewModel {
             analyticsTimeline     = try await store.sentimentTimeline(accountID: acc.id)
             analyticsKeywords     = try await store.topKeywords(accountID: acc.id, limit: 25)
             analyticsEntities     = try await store.topEntities(accountID: acc.id, limit: 25)
+            analyticsSenders      = try await store.topSenders(accountID: acc.id, limit: 15)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func openSenderDetail(_ stat: SenderStat) async {
+        guard let store, let acc = selectedAccount else { return }
+        do {
+            let recent = try await store.messagesFromSender(
+                accountID: acc.id, address: stat.address, limit: 12
+            )
+            selectedSender = stat
+            selectedSenderMessages = recent
+            showSenderDetail = true
         } catch {
             errorMessage = error.localizedDescription
         }

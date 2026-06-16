@@ -26,12 +26,27 @@ struct AnalyticsView: View {
                     if !model.analyticsEntities.isEmpty {
                         entitiesBlock
                     }
+                    if !model.analyticsSenders.isEmpty {
+                        sendersBlock
+                    }
                 }
                 .padding(20)
             }
         }
         .frame(minWidth: 720, minHeight: 580)
         .task { await model.refreshAnalytics() }
+        .sheet(isPresented: Binding(
+            get: { model.showSenderDetail },
+            set: { model.showSenderDetail = $0 }
+        )) {
+            if let s = model.selectedSender {
+                SenderDetailView(
+                    address: s.address,
+                    stat: s,
+                    recentMessages: model.selectedSenderMessages
+                )
+            }
+        }
     }
 
     private var header: some View {
@@ -165,6 +180,50 @@ struct AnalyticsView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder private var sendersBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Top contacts").font(.headline)
+            ForEach(model.analyticsSenders) { s in
+                Button {
+                    Task { await model.openSenderDetail(s) }
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "person.crop.circle")
+                            .font(.title3)
+                            .foregroundStyle(.tint)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(s.address).font(.callout)
+                            Text("\(s.messageCount) messages · \(s.attachmentMessageCount) with attachments")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if let sent = s.meanSentiment {
+                            Text(String(format: "%+.2f", sent))
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(senderTint(sent))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(senderTint(sent).opacity(0.15), in: Capsule())
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Divider()
+            }
+        }
+    }
+
+    private func senderTint(_ sentiment: Double) -> Color {
+        if sentiment > 0.2 { return .green }
+        if sentiment < -0.2 { return .orange }
+        return .secondary
     }
 
     private func icon(for k: EmailEntity.Kind) -> String {

@@ -1241,6 +1241,112 @@ public actor MailStore {
         return out
     }
 
+    /// Top senders by message count. Joins the NLP cache for mean sentiment
+    /// per sender (NULL when none of their messages have been analyzed yet).
+    /// The hasAttachment flag is at bit 5 (1 << 5 == 32).
+    public func topSenders(accountID: Int64, limit: Int = 25, since: Date? = nil) throws -> [SenderStat] {
+        var clauses = ["m.account_id = ?"]
+        if since != nil { clauses.append("m.date_unix > ?") }
+        let sql = """
+        SELECT m.from_addr,
+               COUNT(*) AS n,
+               MIN(m.date_unix) AS first_seen,
+               MAX(m.date_unix) AS last_seen,
+               AVG(n.sentiment) AS mean_sent,
+               SUM(CASE WHEN (m.flags & 32) = 32 THEN 1 ELSE 0 END) AS att_n
+          FROM messages m
+          LEFT JOIN message_nlp n ON n.message_id = m.id
+         WHERE \(clauses.joined(separator: " AND "))
+         GROUP BY m.from_addr
+         ORDER BY n DESC, m.from_addr ASC
+         LIMIT ?;
+        """
+        let stmt = try conn.prepare(sql)
+        var idx: Int32 = 1
+        try stmt.bind(idx, accountID); idx += 1
+        if let since {
+            try stmt.bind(idx, Int64(since.timeIntervalSince1970)); idx += 1
+        }
+        try stmt.bind(idx, Int64(limit))
+        var out: [SenderStat] = []
+        try stmt.forEachRow { row in
+            guard let addr = row.string(0), !addr.isEmpty else { return true }
+            let mean: Double? = row.isNull(4) ? nil : Double(row.string(4) ?? "0")
+            out.append(SenderStat(
+                address: addr,
+                messageCount: row.int(1),
+                firstSeen: Date(timeIntervalSince1970: TimeInterval(row.int64(2))),
+                lastSeen: Date(timeIntervalSince1970: TimeInterval(row.int64(3))),
+                meanSentiment: mean,
+                attachmentMessageCount: row.int(5)
+            ))
+            return true
+        }
+        return out
+    }
+
+    public func senderStat(accountID: Int64, address: String) throws -> SenderStat? {
+        let stmt = try conn.prepare("""
+        SELECT COUNT(*) AS n,
+               MIN(m.date_unix) AS first_seen,
+               MAX(m.date_unix) AS last_seen,
+               AVG(n.sentiment) AS mean_sent,
+               SUM(CASE WHEN (m.flags & 32) = 32 THEN 1 ELSE 0 END) AS att_n
+          FROM messages m
+          LEFT JOIN message_nlp n ON n.message_id = m.id
+         WHERE m.account_id = ? AND m.from_addr = ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, address)
+        var stat: SenderStat?
+        try stmt.forEachRow { row in
+            let count = row.int(0)
+            if count == 0 { return false }
+            let mean: Double? = row.isNull(3) ? nil : Double(row.string(3) ?? "0")
+            stat = SenderStat(
+                address: address,
+                messageCount: count,
+                firstSeen: Date(timeIntervalSince1970: TimeInterval(row.int64(1))),
+                lastSeen: Date(timeIntervalSince1970: TimeInterval(row.int64(2))),
+                meanSentiment: mean,
+                attachmentMessageCount: row.int(4)
+            )
+            return false
+        }
+        return stat
+    }
+
+    /// Recent message headers from one sender, newest first.
+    public func messagesFromSender(accountID: Int64, address: String, limit: Int = 50) throws -> [MessageHeader] {
+        let stmt = try conn.prepare("""
+        SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+               m.size_bytes, m.flags, m.snippet
+          FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE m.account_id = ? AND m.from_addr = ?
+         ORDER BY m.date_unix DESC, m.id DESC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, address)
+        try stmt.bind(3, Int64(limit))
+        var out: [MessageHeader] = []
+        try stmt.forEachRow { row in
+            out.append(MessageHeader(
+                id: row.int64(0),
+                messageID: row.string(1) ?? "",
+                folder: row.string(2) ?? "",
+                subject: row.string(3) ?? "",
+                fromAddress: row.string(4) ?? "",
+                date: Date(timeIntervalSince1970: TimeInterval(row.int64(5))),
+                sizeBytes: row.int64(6),
+                flags: MessageFlags(rawValue: row.int(7)),
+                snippet: row.string(8)
+            ))
+            return true
+        }
+        return out
+    }
+
     public func sentimentTimeline(accountID: Int64) throws -> [SentimentMonth] {
         let stmt = try conn.prepare("""
         SELECT strftime('%Y-%m', m.date_unix, 'unixepoch') AS month,

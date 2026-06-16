@@ -218,3 +218,30 @@ public struct SentimentMonth: Sendable, Identifiable, Hashable {
     public let messageCount: Int
     public var id: String { month }
 }
+
+public struct SenderStat: Sendable, Identifiable, Hashable {
+    public let address: String
+    public let messageCount: Int
+    public let firstSeen: Date
+    public let lastSeen: Date
+    public let meanSentiment: Double?     // nil when no analyzed messages yet
+    public let attachmentMessageCount: Int
+
+    public var id: String { address }
+
+    public init(
+        address: String,
+        messageCount: Int,
+        firstSeen: Date,
+        lastSeen: Date,
+        meanSentiment: Double?,
+        attachmentMessageCount: Int
+    ) {
+        self.address = address
+        self.messageCount = messageCount
+        self.firstSeen = firstSeen
+        self.lastSeen = lastSeen
+        self.meanSentiment = meanSentiment
+        self.attachmentMessageCount = attachmentMessageCount
+    }
+}
