@@ -48,6 +48,15 @@ final class MailViewModel {
     var isSending: Bool = false
     var sendStatus: String = ""
     var sendError: String?
+
+    // Compose draft (single in-progress draft; survives sheet close)
+    var draftTo: String = ""
+    var draftSubject: String = ""
+    var draftBody: String = ""
+    var draftInReplyTo: String?
+    var draftReferences: [String] = []
+    var lastSentEmailID: String?
+
     var isBackgroundAnalyzing: Bool = false
     var analyticsProgress: AnalysisProgress = AnalysisProgress(analyzed: 0, total: 0)
     var analyticsDistribution: SentimentDistribution = SentimentDistribution(
@@ -244,12 +253,17 @@ final class MailViewModel {
 
     // MARK: - Compose + send
 
-    /// Send a plain-text email through the saved JMAP config. Returns the
+    /// Send the current draft through the saved JMAP config. Threading
+    /// headers come from the draft when this is a reply. Returns the
     /// server-assigned email id on success, or nil if anything failed —
     /// in which case `sendError` carries the user-visible message.
-    func sendMail(from sender: String, to: [String], subject: String, body: String) async -> String? {
+    func sendCurrentDraft() async -> String? {
         sendError = nil
-        guard !to.isEmpty else { sendError = "No recipients"; return nil }
+        let recipients = draftTo
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !recipients.isEmpty else { sendError = "No recipients"; return nil }
         guard let cfg = JMAPConfigStore.first(),
               let url = URL(string: cfg.sessionURL) else {
             sendError = "No JMAP account configured"
@@ -263,19 +277,133 @@ final class MailViewModel {
             let client = JMAPClient(config: .init(sessionURL: url,
                                                   credential: .bearer(cfg.bearerToken)))
             let accID = try await store.upsertAccount(
-                name: cfg.displayName, address: sender, kind: "jmap"
+                name: cfg.displayName, address: cfg.senderEmail, kind: "jmap"
             )
             let sync = JMAPSync(client: client, store: store, localAccountID: accID)
             sendStatus = "Sending…"
             let id = try await sync.sendPlainEmail(
-                from: sender, to: to, subject: subject, body: body
+                from: cfg.senderEmail,
+                to: recipients,
+                subject: draftSubject,
+                body: draftBody,
+                inReplyTo: draftInReplyTo,
+                references: draftReferences
             )
             sendStatus = "Sent."
+            lastSentEmailID = id
+            clearDraft()
             return id
         } catch {
             sendError = error.localizedDescription
             return nil
         }
+    }
+
+    // MARK: - Draft state
+
+    func newMessage() {
+        clearDraft()
+        showCompose = true
+    }
+
+    func startReply(replyAll: Bool = false) {
+        guard let header = selectedHeader else { return }
+        let originalBody = currentBody?.plain ?? ""
+        let sender = JMAPConfigStore.first()?.senderEmail ?? ""
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var refs: [String] = []
+            if let store = self.store,
+               let t = try? await store.messageThreading(rowID: header.id) {
+                refs = t.references
+            }
+            let draft = ComposePrefill.build(
+                mode: replyAll ? .replyAll : .reply,
+                originalSubject: header.subject,
+                originalFrom: header.fromAddress,
+                originalTo: [],
+                originalCc: [],
+                originalDate: header.date,
+                originalBody: originalBody,
+                originalMessageID: header.messageID,
+                originalReferences: refs,
+                currentUserAddress: sender
+            )
+            self.applyDraft(draft)
+            self.showCompose = true
+        }
+    }
+
+    func startForward() {
+        guard let header = selectedHeader else { return }
+        let originalBody = currentBody?.plain ?? ""
+        let sender = JMAPConfigStore.first()?.senderEmail ?? ""
+        let draft = ComposePrefill.build(
+            mode: .forward,
+            originalSubject: header.subject,
+            originalFrom: header.fromAddress,
+            originalTo: [],
+            originalCc: [],
+            originalDate: header.date,
+            originalBody: originalBody,
+            originalMessageID: header.messageID,
+            originalReferences: [],
+            currentUserAddress: sender
+        )
+        applyDraft(draft)
+        showCompose = true
+    }
+
+    func persistDraft() {
+        let draft = currentDraftSnapshot()
+        ComposeDraftStore.save(draft)
+    }
+
+    func restoreDraftFromDisk() {
+        if let stored = ComposeDraftStore.load() {
+            applyDraft(stored)
+        }
+    }
+
+    func clearDraft() {
+        draftTo = ""
+        draftSubject = ""
+        draftBody = ""
+        draftInReplyTo = nil
+        draftReferences = []
+        sendError = nil
+        ComposeDraftStore.clear()
+    }
+
+    private func applyDraft(_ d: ComposeDraft) {
+        draftTo = d.to
+        draftSubject = d.subject
+        draftBody = d.body
+        draftInReplyTo = d.inReplyTo
+        draftReferences = d.references
+    }
+
+    private func currentDraftSnapshot() -> ComposeDraft {
+        ComposeDraft(
+            to: draftTo,
+            subject: draftSubject,
+            body: draftBody,
+            inReplyTo: draftInReplyTo,
+            references: draftReferences
+        )
+    }
+
+    private var selectedHeader: MessageHeader? {
+        guard let id = selectedMessageID else { return nil }
+        if let h = headers.first(where: { $0.id == id }) { return h }
+        if let hit = searchResults.first(where: { $0.id == id }) {
+            return MessageHeader(
+                id: hit.id, messageID: hit.messageID, folder: "",
+                subject: hit.subject, fromAddress: hit.fromAddress,
+                date: hit.date, sizeBytes: 0, flags: [], snippet: nil
+            )
+        }
+        return nil
     }
 
     // MARK: - Attachment download

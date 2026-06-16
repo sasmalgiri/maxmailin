@@ -336,7 +336,9 @@ public actor JMAPSync {
         from sender: String,
         to recipients: [String],
         subject: String,
-        body: String
+        body: String,
+        inReplyTo: String? = nil,
+        references: [String] = []
     ) async throws -> String {
         let session = try await client.currentSession()
         guard let jmapAccountID = session.primaryMailAccountID else {
@@ -367,19 +369,24 @@ public actor JMAPSync {
         let bodyPartID = "body1"
         let toList: [[String: String]] = recipients.map { ["email": $0] }
 
+        var emailObject: [String: Any] = [
+            "mailboxIds": [drafts.id: true],
+            "keywords":   ["$draft": true],
+            "from":       [["email": sender]],
+            "to":         toList,
+            "subject":    subject,
+            "bodyValues": [bodyPartID: ["value": body]],
+            "textBody":   [["partId": bodyPartID, "type": "text/plain"]]
+        ]
+        if let inReplyTo {
+            emailObject["inReplyTo"] = [inReplyTo]
+        }
+        if !references.isEmpty {
+            emailObject["references"] = references
+        }
         let createDraft: [String: Any] = [
             "accountId": jmapAccountID,
-            "create": [
-                draftKey: [
-                    "mailboxIds": [drafts.id: true],
-                    "keywords":   ["$draft": true],
-                    "from":       [["email": sender]],
-                    "to":         toList,
-                    "subject":    subject,
-                    "bodyValues": [bodyPartID: ["value": body]],
-                    "textBody":   [["partId": bodyPartID, "type": "text/plain"]]
-                ]
-            ]
+            "create": [draftKey: emailObject]
         ]
         let submission: [String: Any] = [
             "accountId": jmapAccountID,

@@ -1,50 +1,78 @@
 import SwiftUI
 import MaxMailCore
 
-/// Compose sheet. Sends through the configured JMAP account via
-/// JMAPSync.sendPlainEmail. If no JMAP credentials are saved yet,
-/// surfaces the missing config and offers to open Settings.
+/// Compose sheet bound to MailViewModel.draft* fields so prefills (reply,
+/// forward) and on-disk drafts persist across sheet open/close.
 struct ComposeView: View {
     @Environment(MailViewModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-
-    @State private var to = ""
-    @State private var subject = ""
-    @State private var messageBody = ""
     @State private var sentEmailID: String?
 
     var body: some View {
+        @Bindable var bindable = model
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("New message")
+                Text(headerTitle)
                     .font(.title2).bold()
                 Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                Button("Discard") {
+                    model.clearDraft()
+                    dismiss()
+                }
+                Button("Close") {
+                    model.persistDraft()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
             }
             if let cfg = JMAPConfigStore.first() {
-                fields(cfg: cfg)
+                fields(
+                    cfg: cfg,
+                    to: $bindable.draftTo,
+                    subject: $bindable.draftSubject,
+                    body: $bindable.draftBody
+                )
             } else {
                 missingConfig
             }
         }
         .padding(20)
         .frame(minWidth: 560, minHeight: 460)
+        .onAppear {
+            if !model.draftTo.trimmingCharacters(in: .whitespaces).isEmpty
+                || !model.draftSubject.trimmingCharacters(in: .whitespaces).isEmpty
+                || !model.draftBody.trimmingCharacters(in: .whitespaces).isEmpty {
+                return  // already prefilled by reply/forward or kept in-memory
+            }
+            model.restoreDraftFromDisk()
+        }
     }
 
-    @ViewBuilder private func fields(cfg: JMAPConfigStore.StoredConfig) -> some View {
+    private var headerTitle: String {
+        if model.draftInReplyTo != nil { return "Reply" }
+        if model.draftSubject.lowercased().hasPrefix("fwd:") { return "Forward" }
+        return "New message"
+    }
+
+    @ViewBuilder
+    private func fields(
+        cfg: JMAPConfigStore.StoredConfig,
+        to: Binding<String>,
+        subject: Binding<String>,
+        body: Binding<String>
+    ) -> some View {
         Form {
             Section {
                 LabeledContent("From") {
                     Text(cfg.senderEmail).foregroundStyle(.secondary)
                 }
-                TextField("To (comma-separated)", text: $to)
-                TextField("Subject", text: $subject)
+                TextField("To (comma-separated)", text: to)
+                TextField("Subject", text: subject)
             }
             Section("Message") {
-                TextEditor(text: $messageBody)
+                TextEditor(text: body)
                     .font(.body)
-                    .frame(minHeight: 180)
+                    .frame(minHeight: 220)
             }
         }
         .formStyle(.grouped)
@@ -52,6 +80,12 @@ struct ComposeView: View {
         if let id = sentEmailID {
             Label("Sent — server id \(id)", systemImage: "paperplane.fill")
                 .foregroundStyle(.green)
+        }
+        if model.draftInReplyTo != nil {
+            Label("Replying to a thread — In-Reply-To will be set automatically.",
+                  systemImage: "arrowshape.turn.up.left")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
 
         HStack {
@@ -66,18 +100,12 @@ struct ComposeView: View {
                     .foregroundStyle(.orange)
             }
             Spacer()
+            Button("Save draft") {
+                model.persistDraft()
+            }
             Button("Send") {
                 Task {
-                    let recipients = to
-                        .split(separator: ",")
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                    let id = await model.sendMail(
-                        from: cfg.senderEmail,
-                        to: recipients,
-                        subject: subject,
-                        body: messageBody
-                    )
+                    let id = await model.sendCurrentDraft()
                     sentEmailID = id
                     if id != nil {
                         try? await Task.sleep(nanoseconds: 600_000_000)
@@ -86,8 +114,13 @@ struct ComposeView: View {
                 }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(model.isSending || to.isEmpty || subject.isEmpty)
+            .disabled(model.isSending
+                      || model.draftTo.isEmpty
+                      || model.draftSubject.isEmpty)
         }
+        .onChange(of: model.draftTo)      { _, _ in model.persistDraft() }
+        .onChange(of: model.draftSubject) { _, _ in model.persistDraft() }
+        .onChange(of: model.draftBody)    { _, _ in model.persistDraft() }
     }
 
     private var missingConfig: some View {

@@ -32,7 +32,7 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    model.showCompose = true
+                    model.newMessage()
                 } label: {
                     Label("New message", systemImage: "square.and.pencil")
                 }

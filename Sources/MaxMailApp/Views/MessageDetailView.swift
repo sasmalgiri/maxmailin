@@ -15,6 +15,7 @@ struct MessageDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     headerBlock
+                    replyToolbar
                     if !model.currentAnomalies.isEmpty {
                         AnomalyChipsView(anomalies: model.currentAnomalies)
                     }
@@ -51,6 +52,29 @@ struct MessageDetailView: View {
             )
         }
         return nil
+    }
+
+    @ViewBuilder private var replyToolbar: some View {
+        HStack(spacing: 8) {
+            Button {
+                model.startReply(replyAll: false)
+            } label: {
+                Label("Reply", systemImage: "arrowshape.turn.up.left")
+            }
+            Button {
+                model.startReply(replyAll: true)
+            } label: {
+                Label("Reply All", systemImage: "arrowshape.turn.up.left.2")
+            }
+            Button {
+                model.startForward()
+            } label: {
+                Label("Forward", systemImage: "arrowshape.turn.up.right")
+            }
+            Spacer()
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
     }
 
     @ViewBuilder private var headerBlock: some View {

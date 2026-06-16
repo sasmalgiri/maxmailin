@@ -599,6 +599,27 @@ public actor MailStore {
 
     // MARK: - Flag mutation + delete
 
+    /// Pull the RFC 5322 Message-ID + the parsed references chain for one
+    /// message. Used by Reply / Forward to set threading headers on the new
+    /// outbound message so the conversation stitches together server-side.
+    public func messageThreading(rowID: Int64) throws -> (messageID: String, references: [String])? {
+        let stmt = try conn.prepare("""
+        SELECT message_id, references_ FROM messages WHERE id = ?;
+        """)
+        try stmt.bind(1, rowID)
+        var result: (String, [String])?
+        try stmt.forEachRow { row in
+            let mid = row.string(0) ?? ""
+            let refs = (row.string(1) ?? "")
+                .split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { !$0.isEmpty }
+            result = (mid, refs)
+            return false
+        }
+        return result
+    }
+
     public func messageFlags(messageRowID: Int64) throws -> MessageFlags? {
         let stmt = try conn.prepare("SELECT flags FROM messages WHERE id = ?;")
         try stmt.bind(1, messageRowID)
