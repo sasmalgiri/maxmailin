@@ -1,5 +1,6 @@
 import SwiftUI
 import MaxMailCore
+import UserNotifications
 
 /// Minimal JMAP credentials sheet. Persists to UserDefaults via
 /// JMAPConfigStore — adequate for development / single-machine use.
@@ -14,6 +15,8 @@ struct JMAPSettingsView: View {
     @State private var bearerToken = ""
     @State private var isTesting = false
     @State private var testResult: String?
+    @State private var notificationsOn = MailNotifications.enabled
+    @State private var notificationsStatus = "Unknown"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -37,8 +40,31 @@ struct JMAPSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Section("Notifications") {
+                    Toggle("Notify me about new mail", isOn: $notificationsOn)
+                        .onChange(of: notificationsOn) { _, newValue in
+                            MailNotifications.enabled = newValue
+                            if newValue {
+                                Task {
+                                    _ = await MailNotifications.ensureAuthorized()
+                                    await refreshNotificationStatus()
+                                }
+                            }
+                        }
+                    HStack {
+                        Text("System status")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(notificationsStatus)
+                            .font(.caption)
+                    }
+                    Text("Notifications require maxmailin to run as a packaged .app bundle. Posting from `swift run` will silently no-op.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .formStyle(.grouped)
+            .task { await refreshNotificationStatus() }
 
             if let r = testResult {
                 Label(r, systemImage: r.hasPrefix("OK") ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
@@ -73,6 +99,18 @@ struct JMAPSettingsView: View {
                 bearerToken = existing.bearerToken
                 senderEmail = existing.senderEmail
             }
+        }
+    }
+
+    private func refreshNotificationStatus() async {
+        let status = await MailNotifications.currentStatus()
+        switch status {
+        case .authorized:    notificationsStatus = "Authorized"
+        case .provisional:   notificationsStatus = "Authorized (provisional)"
+        case .denied:        notificationsStatus = "Denied — change in System Settings"
+        case .notDetermined: notificationsStatus = "Not asked yet"
+        case .ephemeral:     notificationsStatus = "Ephemeral"
+        @unknown default:    notificationsStatus = "Unknown"
         }
     }
 

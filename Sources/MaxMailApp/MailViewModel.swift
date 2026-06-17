@@ -457,19 +457,36 @@ final class MailViewModel {
             let sync = JMAPSync(client: client, store: store, localAccountID: accID)
             let mailboxes = try await sync.listMailboxes()
             refreshStatus = "Found \(mailboxes.count) mailboxes…"
+            var totalNew = 0
             for box in mailboxes {
                 refreshStatus = "Syncing \(box.name)…"
                 let session = try await client.currentSession()
                 let scope = "email:\(session.primaryMailAccountID ?? "")"
                 if let _ = try await store.syncState(accountID: accID, scope: scope) {
-                    _ = try? await sync.syncIncremental(mailboxHint: box, folderName: box.name)
+                    if let res = try? await sync.syncIncremental(
+                        mailboxHint: box, folderName: box.name
+                    ) {
+                        totalNew += res.added
+                    }
                 } else {
-                    _ = try? await sync.pullRecent(mailbox: box, folderName: box.name, limit: 200)
+                    if let res = try? await sync.pullRecent(
+                        mailbox: box, folderName: box.name, limit: 200
+                    ) {
+                        totalNew += res.ingested
+                    }
                 }
             }
-            refreshStatus = "Up to date"
+            refreshStatus = totalNew > 0 ? "\(totalNew) new" : "Up to date"
             await refreshAccountsAndFolders()
             await loadHeaders()
+            if totalNew > 0 {
+                let example = self.headers.first?.fromAddress
+                Task.detached {
+                    await MailNotifications.postNewMail(
+                        count: totalNew, exampleSender: example
+                    )
+                }
+            }
         } catch {
             errorMessage = "Sync failed: \(error.localizedDescription)"
         }
