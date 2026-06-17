@@ -189,6 +189,10 @@ func rate(_ count: Int, seconds: Double) -> String {
 
 let opts = StressOptions.parse(CommandLine.arguments)
 
+// Force line-buffered stdout so progress and final reports show up in
+// real time even when stdout is redirected to a file.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 let dbURL: URL = {
     if let path = opts.dbPath { return URL(fileURLWithPath: path) }
     let dir = FileManager.default.temporaryDirectory
