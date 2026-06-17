@@ -64,6 +64,10 @@ final class MailViewModel {
     var showAbout: Bool = false
     var showShortcuts: Bool = false
 
+    /// True while the JMAP push channel is connected.
+    var isLivePushConnected: Bool = false
+    private var liveEventSource: JMAPEventSource?
+
     var isBackgroundAnalyzing: Bool = false
     var analyticsProgress: AnalysisProgress = AnalysisProgress(analyzed: 0, total: 0)
     var analyticsDistribution: SentimentDistribution = SentimentDistribution(
@@ -92,6 +96,7 @@ final class MailViewModel {
             statusMessage = "Ready"
             await refreshAccountsAndFolders()
             await loadHeaders()
+            startLivePush()
         } catch {
             errorMessage = "Failed to open store: \(error.localizedDescription)"
         }
@@ -431,6 +436,55 @@ final class MailViewModel {
             )
         }
         return nil
+    }
+
+    // MARK: - Live JMAP push
+
+    /// Open the EventSource stream and run refreshLiveMail on every state
+    /// change the server pushes. Reconnects with backoff if the stream drops.
+    /// No JMAP credentials → silent no-op so dev / archive-only use stays
+    /// quiet.
+    func startLivePush() {
+        guard let cfg = JMAPConfigStore.first(),
+              let url = URL(string: cfg.sessionURL) else { return }
+        let client = JMAPClient(config: .init(sessionURL: url,
+                                              credential: .bearer(cfg.bearerToken)))
+        let source = JMAPEventSource(client: client)
+        liveEventSource = source
+        Task.detached { @MainActor [weak self] in
+            await source.start { @Sendable event in
+                await MailViewModel.handlePushEvent(event)
+            }
+        }
+    }
+
+    func stopLivePush() {
+        let source = liveEventSource
+        liveEventSource = nil
+        isLivePushConnected = false
+        Task.detached { await source?.stop() }
+    }
+
+    /// Static dispatcher routes events back onto the main actor without
+    /// capturing self (the @Sendable closure can't hold an isolated ref).
+    @MainActor
+    private static func handlePushEvent(_ event: JMAPEventSource.Event) {
+        let vm = MailViewModel.shared
+        switch event {
+        case .connected:
+            vm.isLivePushConnected = true
+            vm.statusMessage = "Live"
+        case .stateChange:
+            Task { await vm.refreshLiveMail() }
+        case .disconnected(let reason):
+            vm.isLivePushConnected = false
+            vm.statusMessage = "Disconnected — \(reason)"
+            // Try once more after 30s; gentle, not a tight retry loop.
+            Task {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                vm.startLivePush()
+            }
+        }
     }
 
     // MARK: - Live JMAP refresh

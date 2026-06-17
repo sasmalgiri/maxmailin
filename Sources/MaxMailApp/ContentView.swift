@@ -30,9 +30,20 @@ struct ContentView: View {
                         Text(model.refreshStatus).font(.caption)
                     }
                 } else {
-                    Text(model.statusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        if model.isLivePushConnected {
+                            Circle()
+                                .fill(.green)
+                                .frame(width: 6, height: 6)
+                            Text("Live")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text(model.statusMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             ToolbarItem(placement: .primaryAction) {

@@ -208,7 +208,7 @@ public actor JMAPClient {
         s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
     }
 
-    private func applyAuth(to req: inout URLRequest) {
+    func applyAuth(to req: inout URLRequest) {
         switch config.credential {
         case .bearer(let token):
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
