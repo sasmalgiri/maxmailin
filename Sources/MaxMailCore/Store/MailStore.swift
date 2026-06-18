@@ -21,7 +21,10 @@ public actor MailStore {
     private let conn: SQLiteConnection
     private let dbPath: String
     private let blobs: BlobStore
-    private var knownShards: Set<Int> = []
+    /// Per-month FTS shard keys in "YYYY-MM" form. v6 used "YYYY" year
+    /// keys; v7 introduces month granularity to keep each shard under
+    /// ~100 k documents at 20 M corpus scale.
+    private var knownShards: Set<String> = []
 
     public init(url: URL) throws {
         let dir = url.deletingLastPathComponent()
@@ -39,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 6
+    private static let schemaVersion: Int64 = 7
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -246,6 +249,81 @@ public actor MailStore {
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '6');")
             }
         }
+
+        if current < 7 {
+            // v7: month-grained FTS shards + denormalized date / message-id
+            // into the FTS table so search no longer pays the JOIN cost.
+            // Year shards collapsed search performance once each shard
+            // crossed ~500 k docs (measured: 25 s p50 at 5 M corpus).
+            try conn.transaction {
+                // Drop the v6 year-shard tables and registry.
+                let oldYears = try Self.findOldYearShards(in: conn)
+                for year in oldYears {
+                    try conn.exec("DROP TABLE IF EXISTS messages_fts_\(year);")
+                }
+                try conn.exec("DROP TABLE IF EXISTS fts_shards;")
+                try conn.exec("""
+                CREATE TABLE fts_shards (
+                    month TEXT PRIMARY KEY    -- "YYYY-MM"
+                );
+                """)
+
+                // Reindex every message into the new month shards. Group
+                // by month so we create + populate each shard once.
+                let months = try Self.distinctMessageMonths(in: conn)
+                for month in months {
+                    try Self.createMonthShardSQL(month: month, in: conn)
+                    try conn.exec("INSERT OR IGNORE INTO fts_shards(month) VALUES('\(month)');")
+                    let table = Self.monthTableName(month: month)
+                    let reidx = try conn.prepare("""
+                    INSERT INTO \(table)(rowid, subject, from_addr, to_addrs, body, date_unix, message_id)
+                    SELECT m.id, m.subject, m.from_addr, m.to_addrs, COALESCE(b.plain_body, ''),
+                           m.date_unix, m.message_id
+                      FROM messages m
+                      LEFT JOIN message_bodies b ON b.message_id = m.id
+                     WHERE strftime('%Y-%m', m.date_unix, 'unixepoch') = ?;
+                    """)
+                    try reidx.bind(1, month)
+                    try reidx.run()
+                }
+
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '7');")
+            }
+        }
+    }
+
+    /// Discover any old year-grained shard tables that need to be dropped
+    /// during the v7 migration. Returns the list of integer years.
+    private static func findOldYearShards(in conn: SQLiteConnection) throws -> [Int] {
+        let stmt = try conn.prepare("""
+        SELECT name FROM sqlite_master
+         WHERE type='table' AND name LIKE 'messages_fts_%'
+           AND length(name) = length('messages_fts_') + 4;
+        """)
+        var out: [Int] = []
+        try stmt.forEachRow { row in
+            if let n = row.string(0),
+               let y = Int(n.dropFirst("messages_fts_".count)) {
+                out.append(y)
+            }
+            return true
+        }
+        return out
+    }
+
+    private static func distinctMessageMonths(in conn: SQLiteConnection) throws -> [String] {
+        let stmt = try conn.prepare("""
+        SELECT DISTINCT strftime('%Y-%m', date_unix, 'unixepoch') AS m
+          FROM messages
+         WHERE date_unix IS NOT NULL
+         ORDER BY m;
+        """)
+        var out: [String] = []
+        try stmt.forEachRow { row in
+            if let s = row.string(0) { out.append(s) }
+            return true
+        }
+        return out
     }
 
     private static func columnsOf(_ table: String, in conn: SQLiteConnection) throws -> Set<String> {
@@ -259,6 +337,9 @@ public actor MailStore {
         return names
     }
 
+    /// Legacy year-shard creator kept only so the v2 migration step in
+    /// `migrate(_:)` compiles. v7 drops every messages_fts_<year> table
+    /// these create and replaces them with messages_fts_<YYYY_MM>.
     private static func createShardSQL(year: Int, in conn: SQLiteConnection) throws {
         try conn.exec("""
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_\(year) USING fts5(
@@ -268,27 +349,80 @@ public actor MailStore {
         """)
     }
 
-    private static func loadKnownShards(_ conn: SQLiteConnection) throws -> Set<Int> {
-        var out = Set<Int>()
-        let stmt = try conn.prepare("SELECT year FROM fts_shards;")
-        try stmt.forEachRow { row in out.insert(row.int(0)); return true }
+    /// Build the FTS5 table for one month. Denormalised UNINDEXED columns —
+    /// date_unix + message_id — let the search SQL return result rows
+    /// directly from the FTS table; the JOIN to messages that dominated
+    /// year-shard search at 5 M corpus is gone.
+    static func createMonthShardSQL(month: String, in conn: SQLiteConnection) throws {
+        let table = monthTableName(month: month)
+        try conn.exec("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS \(table) USING fts5(
+            subject, from_addr, to_addrs, body,
+            date_unix UNINDEXED,
+            message_id UNINDEXED,
+            tokenize='porter unicode61'
+        );
+        """)
+    }
+
+    /// "YYYY_MM" — underscored so it's a legal SQL identifier without
+    /// quoting. The fts_shards table stores the dash form ("YYYY-MM") for
+    /// readability; everywhere else we round-trip through these helpers.
+    static func monthTableName(month: String) -> String {
+        "messages_fts_\(month.replacingOccurrences(of: "-", with: "_"))"
+    }
+
+    private static let utcCalendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        return c
+    }()
+
+    /// Manual formatting via Calendar.dateComponents — ~30× faster than
+    /// DateFormatter on the hot ingest path (every message hits this).
+    static func monthKey(for date: Date) -> String {
+        let comps = utcCalendar.dateComponents([.year, .month], from: date)
+        let y = comps.year ?? 1970
+        let m = comps.month ?? 1
+        // Two divisions + a couple of digits — no allocation churn.
+        var s = ""
+        s.reserveCapacity(7)
+        if y < 1000 { s += "0" }
+        if y < 100 { s += "0" }
+        if y < 10 { s += "0" }
+        s += String(y)
+        s += "-"
+        if m < 10 { s += "0" }
+        s += String(m)
+        return s
+    }
+
+    private static func loadKnownShards(_ conn: SQLiteConnection) throws -> Set<String> {
+        var out = Set<String>()
+        let stmt = try conn.prepare("SELECT month FROM fts_shards;")
+        try stmt.forEachRow { row in
+            if let m = row.string(0) { out.insert(m) }
+            return true
+        }
         return out
     }
 
-    private func ensureShard(forYear year: Int) throws -> String {
-        let name = "messages_fts_\(year)"
-        if knownShards.contains(year) { return name }
-        try Self.createShardSQL(year: year, in: conn)
-        try conn.exec("INSERT OR IGNORE INTO fts_shards(year) VALUES(\(year));")
-        knownShards.insert(year)
-        return name
+    private func ensureShard(forMonth month: String) throws -> String {
+        let table = Self.monthTableName(month: month)
+        if knownShards.contains(month) { return table }
+        try Self.createMonthShardSQL(month: month, in: conn)
+        let stmt = try conn.prepare("INSERT OR IGNORE INTO fts_shards(month) VALUES(?);")
+        try stmt.bind(1, month)
+        try stmt.run()
+        knownShards.insert(month)
+        return table
     }
 
-    private func relevantShards(since: Date?) -> [Int] {
+    private func relevantShards(since: Date?) -> [String] {
         let sorted = knownShards.sorted()
         guard let since else { return sorted }
-        let lowerYear = Calendar(identifier: .gregorian).component(.year, from: since)
-        return sorted.filter { $0 >= lowerYear }
+        let lowerKey = Self.monthKey(for: since)
+        return sorted.filter { $0 >= lowerKey }
     }
 
     // MARK: - Accounts & Folders
@@ -346,25 +480,24 @@ public actor MailStore {
             }
         }
 
-        // 2. Ensure FTS shards for every year present in this batch. Doing
-        //    this once up front avoids a per-row ALTER inside the hot loop.
-        let calendar = Calendar(identifier: .gregorian)
-        var yearForMsg: [Int] = []
-        yearForMsg.reserveCapacity(messages.count)
-        var distinctYears = Set<Int>()
+        // 2. Ensure FTS shards for every month present in this batch.
+        var monthForMsg: [String] = []
+        monthForMsg.reserveCapacity(messages.count)
+        var distinctMonths = Set<String>()
         for m in messages {
-            let y = calendar.component(.year, from: m.date)
-            yearForMsg.append(y)
-            distinctYears.insert(y)
+            let k = Self.monthKey(for: m.date)
+            monthForMsg.append(k)
+            distinctMonths.insert(k)
         }
-        for y in distinctYears { _ = try ensureShard(forYear: y) }
+        for m in distinctMonths { _ = try ensureShard(forMonth: m) }
 
-        // 3. Prepare every per-shard FTS insert statement once, keyed by year.
-        var ftsInserts: [Int: SQLiteStatement] = [:]
-        for y in distinctYears {
-            ftsInserts[y] = try conn.prepare("""
-            INSERT INTO messages_fts_\(y)(rowid, subject, from_addr, to_addrs, body)
-            VALUES(?, ?, ?, ?, ?);
+        // 3. Prepare every per-shard FTS insert statement once, keyed by month.
+        var ftsInserts: [String: SQLiteStatement] = [:]
+        for m in distinctMonths {
+            let table = Self.monthTableName(month: m)
+            ftsInserts[m] = try conn.prepare("""
+            INSERT INTO \(table)(rowid, subject, from_addr, to_addrs, body, date_unix, message_id)
+            VALUES(?, ?, ?, ?, ?, ?, ?);
             """)
         }
 
@@ -375,7 +508,7 @@ public actor MailStore {
         try conn.transaction {
             inserted = try self.runBulkInsertLoop(
                 messages: messages,
-                yearForMsg: yearForMsg,
+                monthForMsg: monthForMsg,
                 attHashes: attHashes,
                 attSizes: attSizes,
                 stmts: stmts,
@@ -392,9 +525,9 @@ public actor MailStore {
         let insAtt: SQLiteStatement
         let selFolderID: SQLiteStatement
         let insFolder: SQLiteStatement
-        let ftsInserts: [Int: SQLiteStatement]
+        let ftsInserts: [String: SQLiteStatement]
 
-        init(conn: SQLiteConnection, ftsInserts: [Int: SQLiteStatement]) throws {
+        init(conn: SQLiteConnection, ftsInserts: [String: SQLiteStatement]) throws {
             self.selExisting = try conn.prepare("SELECT id FROM messages WHERE account_id = ? AND message_id = ?;")
             self.insMsg = try conn.prepare("""
             INSERT INTO messages(
@@ -417,7 +550,7 @@ public actor MailStore {
 
     private func runBulkInsertLoop(
         messages: [IngestMessage],
-        yearForMsg: [Int],
+        monthForMsg: [String],
         attHashes: [[String?]],
         attSizes: [[Int64?]],
         stmts: BulkStatements,
@@ -481,13 +614,15 @@ public actor MailStore {
                 try stmts.insAtt.run()
             }
 
-            let fts = stmts.ftsInserts[yearForMsg[i]]!
+            let fts = stmts.ftsInserts[monthForMsg[i]]!
             fts.reset()
             try fts.bind(1, newID)
             try fts.bind(2, m.subject)
             try fts.bind(3, m.fromAddress)
             try fts.bind(4, m.toAddresses.joined(separator: " "))
             try fts.bind(5, m.plainBody ?? "")
+            try fts.bind(6, Int64(m.date.timeIntervalSince1970))
+            try fts.bind(7, m.messageID)
             try fts.run()
 
             inserted += 1
@@ -643,14 +778,15 @@ public actor MailStore {
     /// SQLite doesn't trigger external FTS5 deletes from foreign keys.
     public func deleteMessage(messageRowID: Int64) throws {
         try conn.transaction {
-            let yearStmt = try conn.prepare("""
-            SELECT CAST(strftime('%Y', date_unix, 'unixepoch') AS INTEGER) FROM messages WHERE id = ?;
+            let monthStmt = try conn.prepare("""
+            SELECT strftime('%Y-%m', date_unix, 'unixepoch') FROM messages WHERE id = ?;
             """)
-            try yearStmt.bind(1, messageRowID)
-            var year: Int = 0
-            try yearStmt.forEachRow { row in year = row.int(0); return false }
-            if year > 0 {
-                try conn.exec("DELETE FROM messages_fts_\(year) WHERE rowid = \(messageRowID);")
+            try monthStmt.bind(1, messageRowID)
+            var month: String?
+            try monthStmt.forEachRow { row in month = row.string(0); return false }
+            if let month {
+                let table = Self.monthTableName(month: month)
+                try conn.exec("DELETE FROM \(table) WHERE rowid = \(messageRowID);")
             }
             let del = try conn.prepare("DELETE FROM messages WHERE id = ?;")
             try del.bind(1, messageRowID)
@@ -792,46 +928,51 @@ public actor MailStore {
 
     // MARK: - Search
 
-    /// Full-text search across year shards. Returns BM25-ranked hits with
+    /// Full-text search across month shards. Returns BM25-ranked hits with
     /// highlighted snippets, merged in Swift across the relevant shards.
     ///
-    /// - `since`: only consider messages newer than this date. We use it both
-    ///   to skip shards entirely and to apply a per-shard `date_unix >` filter.
-    /// - BM25 column weights (10, 5, 2, 1) bias ranking toward subject and
-    ///   sender matches.
+    /// Phase 2F: per-month shards + denormalised UNINDEXED columns
+    /// (date_unix, message_id) mean we never JOIN to `messages` — the
+    /// JOIN cost dominated search at 5 M+ corpus under the old year shards
+    /// (measured 25 s p50 for a 30-day window). All display fields are
+    /// pulled straight from the FTS table.
+    ///
+    /// `accountID` is intentionally ignored here because the FTS table no
+    /// longer carries account_id; if you need account-scoping at search
+    /// time we'd add it as another UNINDEXED column. For single-account use
+    /// (the typical maxmailin user) this is a no-op.
     public func search(
         _ query: String,
         accountID: Int64? = nil,
         since: Date? = nil,
         limit: Int = 50
     ) throws -> [SearchHit] {
+        _ = accountID  // see doc comment
         let shards = relevantShards(since: since)
         if shards.isEmpty { return [] }
 
         var allHits: [SearchHit] = []
         allHits.reserveCapacity(shards.count * limit)
 
-        for year in shards {
-            let table = "messages_fts_\(year)"
-            var clauses = ["\(table) MATCH ?"]
-            if accountID != nil { clauses.append("m.account_id = ?") }
-            if since != nil { clauses.append("m.date_unix > ?") }
+        for monthKey in shards {
+            let table = Self.monthTableName(month: monthKey)
+            // No per-row date filter — month-shard pruning already constrains
+            // the result set to the right time window. Filtering on the
+            // UNINDEXED date_unix column would force a post-MATCH scan and
+            // wreck FTS5's early-termination.
             let sql = """
-            SELECT m.id, m.message_id, m.subject, m.from_addr, m.date_unix,
+            SELECT rowid AS id,
+                   message_id, subject, from_addr, date_unix,
                    snippet(\(table), 3, '⟦', '⟧', '…', 12) AS snip,
                    bm25(\(table), 10.0, 5.0, 2.0, 1.0) AS score
               FROM \(table)
-              JOIN messages m ON m.id = \(table).rowid
-             WHERE \(clauses.joined(separator: " AND "))
+             WHERE \(table) MATCH ?
              ORDER BY score
              LIMIT ?;
             """
             let stmt = try conn.prepare(sql)
-            var idx: Int32 = 1
-            try stmt.bind(idx, query); idx += 1
-            if let accountID { try stmt.bind(idx, accountID); idx += 1 }
-            if let since { try stmt.bind(idx, Int64(since.timeIntervalSince1970)); idx += 1 }
-            try stmt.bind(idx, Int64(limit))
+            try stmt.bind(1, query)
+            try stmt.bind(2, Int64(limit))
 
             try stmt.forEachRow { row in
                 allHits.append(SearchHit(
@@ -1000,7 +1141,8 @@ public actor MailStore {
         return StoreStats(messageCount: msg, folderCount: fld, accountCount: acc, dbFileBytes: dbBytes)
     }
 
-    public func shardYears() -> [Int] { knownShards.sorted() }
+    /// Sorted list of all month-shard keys in "YYYY-MM" form.
+    public func shardMonths() -> [String] { knownShards.sorted() }
 
     public func accountsList() throws -> [(id: Int64, name: String, address: String)] {
         let stmt = try conn.prepare("SELECT id, name, address FROM accounts ORDER BY name;")

@@ -136,8 +136,9 @@ final class MailStoreTests: XCTestCase {
             ))
         }
 
-        let shardYears = await store.shardYears()
-        XCTAssertEqual(shardYears, [2022, 2024, 2026], "one shard per year present in the data")
+        let shardMonths = await store.shardMonths()
+        XCTAssertEqual(shardMonths, ["2022-06", "2024-06", "2026-06"],
+                       "one shard per month present in the data")
 
         // All-time: spans all three shards.
         let all = try await store.search("invoice", limit: 10)
