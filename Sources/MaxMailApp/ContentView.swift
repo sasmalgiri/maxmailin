@@ -90,6 +90,8 @@ struct ContentView: View {
                 Menu {
                     Button("JMAP settings…")  { model.showJMAPSettings = true }
                     Button("IMAP settings…")  { model.showIMAPSettings = true }
+                    Divider()
+                    Button("Rules…")          { model.showRules = true }
                 } label: {
                     Label("Accounts", systemImage: "gearshape")
                 }
@@ -118,6 +120,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $bindable.showCommandPalette) {
             CommandPaletteView().environment(model)
+        }
+        .sheet(isPresented: $bindable.showRules) {
+            AutomationRulesView().environment(model)
         }
         .fileImporter(
             isPresented: $bindable.showImportPicker,

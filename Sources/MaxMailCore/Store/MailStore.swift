@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 8
+    private static let schemaVersion: Int64 = 9
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -306,6 +306,41 @@ public actor MailStore {
                 );
                 """)
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '8');")
+            }
+        }
+
+        if current < 9 {
+            // Automation rules: per-account ordered list of
+            // condition→action sets that the RulesEngine evaluates against
+            // each newly ingested message. Conditions and actions are
+            // serialised as JSON so the storage layer doesn't need to know
+            // their shape.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS automation_rules (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    name            TEXT NOT NULL,
+                    enabled         INTEGER NOT NULL DEFAULT 1,
+                    priority        INTEGER NOT NULL DEFAULT 0,
+                    conditions_json TEXT NOT NULL,
+                    actions_json    TEXT NOT NULL,
+                    created_at      INTEGER NOT NULL
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_rules_account ON automation_rules(account_id, enabled, priority DESC);")
+                // Tracks rule applications so re-running the engine is
+                // idempotent — we skip messages whose rule was already
+                // applied.
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS rule_applications (
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    rule_id    INTEGER NOT NULL REFERENCES automation_rules(id) ON DELETE CASCADE,
+                    applied_at INTEGER NOT NULL,
+                    PRIMARY KEY(message_id, rule_id)
+                );
+                """)
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '9');")
             }
         }
     }
@@ -1260,6 +1295,215 @@ public actor MailStore {
             return out.count < limit
         }
         return out
+    }
+
+    // MARK: - Automation rules
+
+    public func rules(accountID: Int64) throws -> [AutomationRule] {
+        let stmt = try conn.prepare("""
+        SELECT id, account_id, name, enabled, priority,
+               conditions_json, actions_json, created_at
+          FROM automation_rules
+         WHERE account_id = ?
+         ORDER BY priority DESC, id ASC;
+        """)
+        try stmt.bind(1, accountID)
+        var out: [AutomationRule] = []
+        try stmt.forEachRow { row in
+            guard let condJSON = row.string(5),
+                  let actJSON = row.string(6),
+                  let cond: RuleConditions = self.decodeJSON(condJSON),
+                  let act:  RuleActions    = self.decodeJSON(actJSON) else {
+                return true
+            }
+            out.append(AutomationRule(
+                id: row.int64(0),
+                accountID: row.int64(1),
+                name: row.string(2) ?? "",
+                enabled: row.int(3) == 1,
+                priority: row.int(4),
+                conditions: cond,
+                actions: act,
+                createdAt: Date(timeIntervalSince1970: TimeInterval(row.int64(7)))
+            ))
+            return true
+        }
+        return out
+    }
+
+    @discardableResult
+    public func addRule(_ rule: AutomationRule) throws -> Int64 {
+        let enc = JSONEncoder()
+        let condJSON = (try? String(data: enc.encode(rule.conditions), encoding: .utf8)) ?? "{}"
+        let actJSON  = (try? String(data: enc.encode(rule.actions),    encoding: .utf8)) ?? "{}"
+        let stmt = try conn.prepare("""
+        INSERT INTO automation_rules(
+            account_id, name, enabled, priority,
+            conditions_json, actions_json, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        RETURNING id;
+        """)
+        try stmt.bind(1, rule.accountID)
+        try stmt.bind(2, rule.name)
+        try stmt.bind(3, Int64(rule.enabled ? 1 : 0))
+        try stmt.bind(4, Int64(rule.priority))
+        try stmt.bind(5, condJSON)
+        try stmt.bind(6, actJSON)
+        try stmt.bind(7, Int64(rule.createdAt.timeIntervalSince1970))
+        var newID: Int64 = 0
+        try stmt.forEachRow { row in newID = row.int64(0); return false }
+        return newID
+    }
+
+    public func updateRule(_ rule: AutomationRule) throws {
+        let enc = JSONEncoder()
+        let condJSON = (try? String(data: enc.encode(rule.conditions), encoding: .utf8)) ?? "{}"
+        let actJSON  = (try? String(data: enc.encode(rule.actions),    encoding: .utf8)) ?? "{}"
+        let stmt = try conn.prepare("""
+        UPDATE automation_rules
+           SET name=?, enabled=?, priority=?, conditions_json=?, actions_json=?
+         WHERE id=?;
+        """)
+        try stmt.bind(1, rule.name)
+        try stmt.bind(2, Int64(rule.enabled ? 1 : 0))
+        try stmt.bind(3, Int64(rule.priority))
+        try stmt.bind(4, condJSON)
+        try stmt.bind(5, actJSON)
+        try stmt.bind(6, rule.id)
+        try stmt.run()
+    }
+
+    public func deleteRule(ruleID: Int64) throws {
+        let stmt = try conn.prepare("DELETE FROM automation_rules WHERE id = ?;")
+        try stmt.bind(1, ruleID)
+        try stmt.run()
+    }
+
+    /// Run every enabled rule for `accountID` against the next `batchSize`
+    /// messages that haven't been processed yet (no rule_applications row).
+    /// Returns the number of (message, rule) applications performed.
+    ///
+    /// Streaming discipline: we pull message ids in pages of `batchSize`,
+    /// load each message's snapshot lazily (header + body + attachment
+    /// flag), evaluate rules, and write the application log row to skip it
+    /// next time. Memory is bounded to one batchSize × snapshot size.
+    @discardableResult
+    public func applyRulesBatch(accountID: Int64, batchSize: Int = 200) throws -> Int {
+        let rules = try self.rules(accountID: accountID).filter { $0.enabled }
+        guard !rules.isEmpty else { return 0 }
+
+        // Messages without a rule_applications row for any of these rules
+        // (newest first — feels like rules ran on the inbox at delivery).
+        let ids = try unappliedMessageIDs(accountID: accountID, limit: batchSize)
+        if ids.isEmpty { return 0 }
+
+        var applied = 0
+        for rowID in ids {
+            guard let snapshot = try messageSnapshot(messageRowID: rowID) else { continue }
+            for rule in rules {
+                if RuleMatcher.matches(rule, snapshot) {
+                    try applyRule(rule, toMessageRowID: rowID, accountID: accountID)
+                    applied += 1
+                }
+                // Always log that we've seen this message for this rule
+                // so re-sweeps are idempotent.
+                try logRuleApplication(ruleID: rule.id, messageRowID: rowID)
+            }
+        }
+        return applied
+    }
+
+    private func unappliedMessageIDs(accountID: Int64, limit: Int) throws -> [Int64] {
+        let stmt = try conn.prepare("""
+        SELECT m.id FROM messages m
+         WHERE m.account_id = ?
+           AND NOT EXISTS (
+                 SELECT 1 FROM rule_applications a
+                  WHERE a.message_id = m.id
+                  LIMIT 1
+               )
+         ORDER BY m.date_unix DESC, m.id DESC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [Int64] = []
+        try stmt.forEachRow { row in out.append(row.int64(0)); return true }
+        return out
+    }
+
+    private func messageSnapshot(messageRowID: Int64) throws -> RuleMatcher.MessageSnapshot? {
+        let stmt = try conn.prepare("""
+        SELECT m.subject, m.from_addr, m.flags,
+               COALESCE(b.plain_body, '')
+          FROM messages m
+          LEFT JOIN message_bodies b ON b.message_id = m.id
+         WHERE m.id = ?;
+        """)
+        try stmt.bind(1, messageRowID)
+        var result: RuleMatcher.MessageSnapshot?
+        try stmt.forEachRow { row in
+            let flags = MessageFlags(rawValue: row.int(2))
+            result = RuleMatcher.MessageSnapshot(
+                subject: row.string(0) ?? "",
+                fromAddress: row.string(1) ?? "",
+                plainBody: row.string(3) ?? "",
+                hasAttachment: flags.contains(.hasAttachment)
+            )
+            return false
+        }
+        return result
+    }
+
+    private func applyRule(
+        _ rule: AutomationRule,
+        toMessageRowID rowID: Int64,
+        accountID: Int64
+    ) throws {
+        // Flag mutations.
+        if rule.actions.markSeen || rule.actions.markFlagged {
+            var flags = (try messageFlags(messageRowID: rowID)) ?? []
+            if rule.actions.markSeen    { flags.insert(.seen) }
+            if rule.actions.markFlagged { flags.insert(.flagged) }
+            try updateMessageFlags(messageRowID: rowID, flags: flags)
+        }
+        // Folder move.
+        if let target = rule.actions.moveToFolder, !target.isEmpty {
+            try moveMessage(messageRowID: rowID, accountID: accountID, toFolder: target)
+        }
+    }
+
+    private func logRuleApplication(ruleID: Int64, messageRowID: Int64) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO rule_applications(message_id, rule_id, applied_at)
+        VALUES(?, ?, ?)
+        ON CONFLICT(message_id, rule_id) DO NOTHING;
+        """)
+        try stmt.bind(1, messageRowID)
+        try stmt.bind(2, ruleID)
+        try stmt.bind(3, Int64(Date().timeIntervalSince1970))
+        try stmt.run()
+    }
+
+    /// Move a message to a different folder by reassigning its folder_id.
+    /// Creates the destination folder lazily if it doesn't exist yet so
+    /// rules can target user-defined labels without a separate setup step.
+    public func moveMessage(messageRowID: Int64, accountID: Int64, toFolder folder: String) throws {
+        let fid: Int64
+        if let existing = try folderIDLookup(accountID: accountID, folder: folder) {
+            fid = existing
+        } else {
+            let ins = try conn.prepare("INSERT INTO folders(account_id, path) VALUES(?, ?) RETURNING id;")
+            try ins.bind(1, accountID)
+            try ins.bind(2, folder)
+            var newID: Int64 = 0
+            try ins.forEachRow { row in newID = row.int64(0); return false }
+            fid = newID
+        }
+        let upd = try conn.prepare("UPDATE messages SET folder_id = ? WHERE id = ?;")
+        try upd.bind(1, fid)
+        try upd.bind(2, messageRowID)
+        try upd.run()
     }
 
     // MARK: - Stats
