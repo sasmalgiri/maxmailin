@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 10
+    private static let schemaVersion: Int64 = 11
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -364,6 +364,24 @@ public actor MailStore {
                 """)
                 try conn.exec("CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_log(subject_kind, subject_id);")
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '10');")
+            }
+        }
+
+        if current < 11 {
+            // Per-message integrity seals. content_sha256 is a SHA-256 over
+            // the canonical projection of the message row (header fields,
+            // bodies, sorted attachment hashes). Verification recomputes the
+            // same projection from the current row and compares. Drift means
+            // either deliberate tampering or a corrupted row.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS message_seals (
+                    message_id      INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    sealed_at       INTEGER NOT NULL,
+                    content_sha256  TEXT NOT NULL
+                );
+                """)
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '11');")
             }
         }
     }
@@ -1628,6 +1646,130 @@ public actor MailStore {
         try stmt.bind(1, newActor)
         try stmt.bind(2, rowID)
         try stmt.run()
+    }
+
+    // MARK: - Message seals (chain-of-custody integrity baselines)
+
+    /// Computes the canonical SHA-256 over the *currently stored* projection
+    /// of a message: identifying headers, both bodies, and the sorted list of
+    /// attachment hashes. The canonical form is line-delimited `key:value`
+    /// pairs in fixed order; same field order in seal and verify means the
+    /// digest is reproducible across runs and platforms.
+    ///
+    /// Returns nil when the message row does not exist.
+    public func canonicalMessageHash(messageRowID: Int64) throws -> String? {
+        let head = try conn.prepare("""
+        SELECT message_id, in_reply_to, references_,
+               subject, from_addr, to_addrs, cc_addrs,
+               date_unix, size_bytes
+          FROM messages WHERE id = ?;
+        """)
+        try head.bind(1, messageRowID)
+        var fields: [(String, String)] = []
+        var found = false
+        try head.forEachRow { row in
+            found = true
+            fields.append(("message_id", row.string(0) ?? ""))
+            fields.append(("in_reply_to", row.string(1) ?? ""))
+            fields.append(("references", row.string(2) ?? ""))
+            fields.append(("subject", row.string(3) ?? ""))
+            fields.append(("from", row.string(4) ?? ""))
+            fields.append(("to", row.string(5) ?? ""))
+            fields.append(("cc", row.string(6) ?? ""))
+            fields.append(("date_unix", String(row.int64(7))))
+            fields.append(("size_bytes", String(row.int64(8))))
+            return false
+        }
+        guard found else { return nil }
+
+        let body = try conn.prepare("""
+        SELECT plain_body, html_body FROM message_bodies WHERE message_id = ?;
+        """)
+        try body.bind(1, messageRowID)
+        var plain = "", html = ""
+        try body.forEachRow { row in
+            plain = row.string(0) ?? ""
+            html = row.string(1) ?? ""
+            return false
+        }
+        fields.append(("plain_body", plain))
+        fields.append(("html_body", html))
+
+        let att = try conn.prepare("""
+        SELECT COALESCE(sha256, '') FROM attachments
+         WHERE message_id = ?
+         ORDER BY id ASC;
+        """)
+        try att.bind(1, messageRowID)
+        var atts: [String] = []
+        try att.forEachRow { row in
+            atts.append(row.string(0) ?? "")
+            return true
+        }
+        fields.append(("attachments", atts.joined(separator: ",")))
+
+        // Canonicalisation: each pair becomes "key:length:value\n" so a value
+        // containing a colon or newline cannot collide with the field
+        // separator and produce the same digest as a different message.
+        var canon = ""
+        for (k, v) in fields {
+            canon += "\(k):\(v.utf8.count):\(v)\n"
+        }
+        return BlobStore.sha256Hex(Data(canon.utf8))
+    }
+
+    /// Persist (or replace) the integrity seal for a message.
+    public func recordMessageSeal(
+        messageRowID: Int64, sealedAt: Date, contentSHA256Hex: String
+    ) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO message_seals(message_id, sealed_at, content_sha256)
+        VALUES (?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            sealed_at = excluded.sealed_at,
+            content_sha256 = excluded.content_sha256;
+        """)
+        try stmt.bind(1, messageRowID)
+        try stmt.bind(2, Int64(sealedAt.timeIntervalSince1970))
+        try stmt.bind(3, contentSHA256Hex)
+        try stmt.run()
+    }
+
+    public func messageSeal(messageRowID: Int64) throws -> (sealedAt: Date, sha256Hex: String)? {
+        let stmt = try conn.prepare("""
+        SELECT sealed_at, content_sha256 FROM message_seals WHERE message_id = ?;
+        """)
+        try stmt.bind(1, messageRowID)
+        var out: (Date, String)?
+        try stmt.forEachRow { row in
+            out = (Date(timeIntervalSince1970: TimeInterval(row.int64(0))),
+                   row.string(1) ?? "")
+            return false
+        }
+        return out
+    }
+
+    /// Returns message rowIDs in `candidates` that don't yet have a seal.
+    /// Used by `ChainOfCustodyManager.sealMessages` to skip already-sealed
+    /// rows without forcing the caller to round-trip per id.
+    public func unsealedMessageRowIDs(_ candidates: [Int64]) throws -> [Int64] {
+        guard !candidates.isEmpty else { return [] }
+        var sealed = Set<Int64>()
+        let chunkSize = 500
+        for start in stride(from: 0, to: candidates.count, by: chunkSize) {
+            let end = min(start + chunkSize, candidates.count)
+            let chunk = Array(candidates[start..<end])
+            let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+            let stmt = try conn.prepare(
+                "SELECT message_id FROM message_seals WHERE message_id IN (\(placeholders));"
+            )
+            for (i, id) in chunk.enumerated() { try stmt.bind(Int32(i + 1), id) }
+            try stmt.forEachRow { row in
+                sealed.insert(row.int64(0))
+                return true
+            }
+        }
+        return candidates.filter { !sealed.contains($0) }
     }
 
     // MARK: - Stats
