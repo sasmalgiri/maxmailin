@@ -37,6 +37,9 @@ struct MaxMailApp: App {
                     model.showShortcuts = true
                 }
                 .keyboardShortcut("?", modifiers: [.command, .shift])
+                Button("Show welcome…") {
+                    model.showWelcome = true
+                }
             }
         }
     }

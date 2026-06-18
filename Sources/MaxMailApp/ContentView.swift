@@ -113,6 +113,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $bindable.showAbout) { AboutView() }
         .sheet(isPresented: $bindable.showShortcuts) { ShortcutsView() }
+        .sheet(isPresented: $bindable.showWelcome) {
+            WelcomeView().environment(model)
+        }
         .fileImporter(
             isPresented: $bindable.showImportPicker,
             allowedContentTypes: [.data],

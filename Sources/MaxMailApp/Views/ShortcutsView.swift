@@ -7,12 +7,17 @@ struct ShortcutsView: View {
         ("File", [
             ("⌘N", "New message"),
             ("⌘I", "Import mbox…"),
-            ("⌘R", "Refresh JMAP")
+            ("⌘R", "Refresh JMAP / IMAP")
         ]),
         ("View", [
             ("⌘F", "Search mail"),
             ("⇧⌘A", "About maxmailin"),
             ("⇧⌘?", "Keyboard shortcuts")
+        ]),
+        ("Compose", [
+            ("⌘N", "Start a new message"),
+            ("Right-click → Reply", "Reply prefilled with quote + threading"),
+            ("Right-click → Forward", "Forward with original headers + body")
         ])
     ]
 

@@ -64,6 +64,7 @@ final class MailViewModel {
     var refreshStatus: String = ""
     var showAbout: Bool = false
     var showShortcuts: Bool = false
+    var showWelcome: Bool = false
 
     /// True while the JMAP push channel is connected.
     var isLivePushConnected: Bool = false
@@ -98,6 +99,10 @@ final class MailViewModel {
             await refreshAccountsAndFolders()
             await loadHeaders()
             startLivePush()
+            // First launch — show the welcome flow. Re-launches don't.
+            if !WelcomeShownStore.hasShown {
+                showWelcome = true
+            }
         } catch {
             errorMessage = "Failed to open store: \(error.localizedDescription)"
         }
