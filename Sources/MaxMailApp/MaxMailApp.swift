@@ -4,6 +4,7 @@ import MaxMailCore
 @main
 struct MaxMailApp: App {
     @State private var model = MailViewModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -11,6 +12,16 @@ struct MaxMailApp: App {
                 .environment(model)
                 .task {
                     await model.bootstrap()
+                }
+                .onChange(of: scenePhase) { _, new in
+                    switch new {
+                    case .background, .inactive:
+                        model.handleBackgrounded()
+                    case .active:
+                        model.handleForegrounded()
+                    @unknown default:
+                        break
+                    }
                 }
                 .frame(minWidth: 1000, minHeight: 600)
         }

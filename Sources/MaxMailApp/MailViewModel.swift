@@ -67,6 +67,9 @@ final class MailViewModel {
     var showWelcome: Bool = false
     var showCommandPalette: Bool = false
     var showRules: Bool = false
+    var showSecurity: Bool = false
+    var isLocked: Bool = false
+    private var lastBackgroundedAt: Date?
 
     /// True while the JMAP push channel is connected.
     var isLivePushConnected: Bool = false
@@ -104,6 +107,11 @@ final class MailViewModel {
             // First launch — show the welcome flow. Re-launches don't.
             if !WelcomeShownStore.hasShown {
                 showWelcome = true
+            }
+            // App lock: if the user has enabled biometric lock, start
+            // locked so the next foreground action is to authenticate.
+            if BiometricLock.enabled {
+                isLocked = true
             }
         } catch {
             errorMessage = "Failed to open store: \(error.localizedDescription)"
@@ -388,6 +396,27 @@ final class MailViewModel {
     func newMessage() {
         clearDraft()
         showCompose = true
+    }
+
+    // MARK: - App lock lifecycle
+
+    /// Called when the app moves to the background (scenePhase change).
+    /// We remember the timestamp so the foreground hook can decide
+    /// whether the re-lock window has elapsed.
+    func handleBackgrounded() {
+        lastBackgroundedAt = Date()
+    }
+
+    /// Called when the app comes back to the foreground. Locks if the
+    /// idle window has been crossed.
+    func handleForegrounded() {
+        guard BiometricLock.enabled else { return }
+        guard let backgroundedAt = lastBackgroundedAt else { return }
+        let elapsed = Date().timeIntervalSince(backgroundedAt)
+        if elapsed >= BiometricLock.relockAfterSeconds {
+            isLocked = true
+        }
+        lastBackgroundedAt = nil
     }
 
     func startReply(replyAll: Bool = false) {

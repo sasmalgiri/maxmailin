@@ -92,6 +92,7 @@ struct ContentView: View {
                     Button("IMAP settings…")  { model.showIMAPSettings = true }
                     Divider()
                     Button("Rules…")          { model.showRules = true }
+                    Button("Security…")       { model.showSecurity = true }
                 } label: {
                     Label("Accounts", systemImage: "gearshape")
                 }
@@ -123,6 +124,16 @@ struct ContentView: View {
         }
         .sheet(isPresented: $bindable.showRules) {
             AutomationRulesView().environment(model)
+        }
+        .sheet(isPresented: $bindable.showSecurity) {
+            SecuritySettingsView()
+        }
+        .overlay {
+            if model.isLocked {
+                LockScreenView()
+                    .environment(model)
+                    .transition(.opacity)
+            }
         }
         .fileImporter(
             isPresented: $bindable.showImportPicker,
