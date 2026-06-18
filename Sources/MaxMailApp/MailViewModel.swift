@@ -65,6 +65,7 @@ final class MailViewModel {
     var showAbout: Bool = false
     var showShortcuts: Bool = false
     var showWelcome: Bool = false
+    var showCommandPalette: Bool = false
 
     /// True while the JMAP push channel is connected.
     var isLivePushConnected: Bool = false

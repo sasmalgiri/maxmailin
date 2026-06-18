@@ -116,6 +116,9 @@ struct ContentView: View {
         .sheet(isPresented: $bindable.showWelcome) {
             WelcomeView().environment(model)
         }
+        .sheet(isPresented: $bindable.showCommandPalette) {
+            CommandPaletteView().environment(model)
+        }
         .fileImporter(
             isPresented: $bindable.showImportPicker,
             allowedContentTypes: [.data],

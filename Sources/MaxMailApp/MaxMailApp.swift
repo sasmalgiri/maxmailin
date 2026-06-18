@@ -25,6 +25,10 @@ struct MaxMailApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command])
                 .disabled(model.isRefreshing)
+                Button("Command palette…") {
+                    model.showCommandPalette = true
+                }
+                .keyboardShortcut("k", modifiers: [.command])
             }
             CommandGroup(replacing: .appInfo) {
                 Button("About maxmailin") {

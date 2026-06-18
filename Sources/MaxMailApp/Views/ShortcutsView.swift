@@ -7,7 +7,8 @@ struct ShortcutsView: View {
         ("File", [
             ("⌘N", "New message"),
             ("⌘I", "Import mbox…"),
-            ("⌘R", "Refresh JMAP / IMAP")
+            ("⌘R", "Refresh JMAP / IMAP"),
+            ("⌘K", "Command palette")
         ]),
         ("View", [
             ("⌘F", "Search mail"),
