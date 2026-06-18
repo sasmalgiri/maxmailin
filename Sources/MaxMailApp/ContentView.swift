@@ -57,8 +57,10 @@ struct ContentView: View {
                     }
                 }
                 .keyboardShortcut("r", modifiers: [.command])
-                .disabled(model.isRefreshing || JMAPConfigStore.first() == nil)
-                .help("Sync with the configured JMAP server")
+                .disabled(model.isRefreshing
+                          || (JMAPConfigStore.first() == nil
+                              && IMAPConfigStore.first() == nil))
+                .help("Sync with the configured mail server")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -85,10 +87,11 @@ struct ContentView: View {
                 .disabled(model.isImporting)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    model.showJMAPSettings = true
+                Menu {
+                    Button("JMAP settings…")  { model.showJMAPSettings = true }
+                    Button("IMAP settings…")  { model.showIMAPSettings = true }
                 } label: {
-                    Label("JMAP settings", systemImage: "gearshape")
+                    Label("Accounts", systemImage: "gearshape")
                 }
             }
         }
@@ -102,6 +105,10 @@ struct ContentView: View {
         }
         .sheet(isPresented: $bindable.showJMAPSettings) {
             JMAPSettingsView()
+                .environment(model)
+        }
+        .sheet(isPresented: $bindable.showIMAPSettings) {
+            IMAPSettingsView()
                 .environment(model)
         }
         .sheet(isPresented: $bindable.showAbout) { AboutView() }

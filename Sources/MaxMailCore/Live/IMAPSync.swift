@@ -39,12 +39,12 @@ public actor IMAPSync {
         try await client.login()
         defer { Task { await client.disconnect() } }
 
-        _ = try await client.select(folder: folder)
+        let selected = try await client.select(folder: folder)
         let uids = try await client.uidSearch(since: since)
         let total = uids.count
         let fallback = Date()
 
-        var batch: [IngestMessage] = []
+        var batch: [(msg: IngestMessage, uid: Int64)] = []
         batch.reserveCapacity(batchSize)
         var ingestedCount = 0
         var skippedCount = 0
@@ -53,38 +53,96 @@ public actor IMAPSync {
         let stream = client.streamMessages(uids: uids, chunkSize: chunkSize)
         for try await imapMessage in stream {
             let parsed = RFC5322Parser.parse(imapMessage.raw, fallbackDate: fallback)
-            batch.append(buildIngest(
+            let ingest = buildIngest(
                 from: parsed,
                 folder: folder,
                 rawSize: Int64(imapMessage.raw.count),
                 flags: Self.flags(from: imapMessage.flags)
-            ))
+            )
+            batch.append((ingest, imapMessage.uid))
             seen += 1
             onProgress?(seen, total)
 
             if batch.count >= batchSize {
-                let result = try await flush(&batch)
+                let result = try await flush(&batch, uidValidity: selected.uidValidity)
                 ingestedCount += result.ingested
                 skippedCount += result.skipped
             }
         }
         if !batch.isEmpty {
-            let result = try await flush(&batch)
+            let result = try await flush(&batch, uidValidity: selected.uidValidity)
             ingestedCount += result.ingested
             skippedCount += result.skipped
         }
         return PullResult(ingested: ingestedCount, skipped: skippedCount)
     }
 
-    private func flush(_ batch: inout [IngestMessage]) async throws -> (ingested: Int, skipped: Int) {
-        // bulkIngest is idempotent on (account_id, message_id); count
-        // inserted vs. pre-existing by checking each row's prior lookup
-        // would be O(N) extra queries, so we just trust bulkIngest's
-        // returned count for ingested and treat the remainder as skipped.
-        let count = batch.count
-        let inserted = try await store.bulkIngest(batch)
+    /// Push the batch into MailStore, then link each row to its IMAP UID
+    /// so later flag writes can target it.
+    private func flush(
+        _ batch: inout [(msg: IngestMessage, uid: Int64)],
+        uidValidity: Int64
+    ) async throws -> (ingested: Int, skipped: Int) {
+        let messages = batch.map(\.msg)
+        let count = messages.count
+        let inserted = try await store.bulkIngest(messages)
+
+        // Link UIDs. We resolve folder_id once per batch and reuse.
+        // (account_id, RFC5322 messageID) → local rowID via lookupMessageRowID.
+        guard let firstFolder = messages.first?.folder,
+              let folderID = try await store.folderIDLookup(
+                accountID: localAccountID, folder: firstFolder
+              )
+        else {
+            batch.removeAll(keepingCapacity: true)
+            return (inserted, count - inserted)
+        }
+        for entry in batch {
+            if let rowID = try await store.lookupMessageRowID(
+                accountID: localAccountID, messageID: entry.msg.messageID
+            ) {
+                try await store.linkIMAP(
+                    localRowID: rowID,
+                    folderID: folderID,
+                    uidValidity: uidValidity,
+                    uid: entry.uid
+                )
+            }
+        }
         batch.removeAll(keepingCapacity: true)
         return (inserted, count - inserted)
+    }
+
+    // MARK: - Flag writes
+
+    public func setSeen(localRowID: Int64, _ seen: Bool) async throws {
+        try await applyFlag(localRowID: localRowID, keyword: "\\Seen", add: seen, localFlag: .seen)
+    }
+
+    public func setFlagged(localRowID: Int64, _ flagged: Bool) async throws {
+        try await applyFlag(localRowID: localRowID, keyword: "\\Flagged", add: flagged, localFlag: .flagged)
+    }
+
+    private func applyFlag(
+        localRowID: Int64,
+        keyword: String,
+        add: Bool,
+        localFlag: MessageFlags
+    ) async throws {
+        guard let mapping = try await store.imapMapping(forLocalRowID: localRowID) else {
+            throw IMAPError.commandFailed("local row \(localRowID) has no IMAP mapping")
+        }
+        try await client.connect()
+        try await client.login()
+        defer { Task { await client.disconnect() } }
+        _ = try await client.select(folder: mapping.folderPath)
+        try await client.setFlag(uid: mapping.uid, keyword: keyword, add: add)
+
+        // Reflect locally.
+        if var current = try await store.messageFlags(messageRowID: localRowID) {
+            if add { current.insert(localFlag) } else { current.remove(localFlag) }
+            try await store.updateMessageFlags(messageRowID: localRowID, flags: current)
+        }
     }
 
     private func buildIngest(

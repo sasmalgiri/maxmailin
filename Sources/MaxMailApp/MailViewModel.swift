@@ -46,6 +46,7 @@ final class MailViewModel {
     var showAnalytics: Bool = false
     var showCompose: Bool = false
     var showJMAPSettings: Bool = false
+    var showIMAPSettings: Bool = false
     var isSending: Bool = false
     var sendStatus: String = ""
     var sendError: String?
@@ -489,10 +490,56 @@ final class MailViewModel {
 
     // MARK: - Live JMAP refresh
 
+    /// Sync against whichever live account is configured. We prefer JMAP
+    /// (push-aware + delta-friendly) when present and fall back to IMAP
+    /// for everything else (Gmail/iCloud/Yahoo via app passwords).
+    func refreshLiveMail() async {
+        if JMAPConfigStore.first() != nil {
+            await refreshLiveMailJMAP()
+        } else if IMAPConfigStore.first() != nil {
+            await refreshLiveMailIMAP()
+        } else {
+            errorMessage = "No mail account configured"
+        }
+    }
+
+    private func refreshLiveMailIMAP() async {
+        guard let cfg = IMAPConfigStore.first(), let store else { return }
+        isRefreshing = true
+        refreshStatus = "Connecting…"
+        defer { isRefreshing = false }
+        do {
+            let accID = try await store.upsertAccount(
+                name: cfg.displayName, address: cfg.senderEmail, kind: "imap"
+            )
+            let client = IMAPClient(config: IMAPConfig(
+                host: cfg.host, port: cfg.port, useTLS: cfg.useTLS,
+                username: cfg.username, password: cfg.password
+            ))
+            let sync = IMAPSync(client: client, store: store, localAccountID: accID)
+            refreshStatus = "Syncing INBOX…"
+            let result = try await sync.pullRecent(folder: "INBOX",
+                                                   since: Date().addingTimeInterval(-30 * 86_400))
+            refreshStatus = result.ingested > 0 ? "\(result.ingested) new" : "Up to date"
+            await refreshAccountsAndFolders()
+            await loadHeaders()
+            if result.ingested > 0 {
+                let example = self.headers.first?.fromAddress
+                Task.detached {
+                    await MailNotifications.postNewMail(
+                        count: result.ingested, exampleSender: example
+                    )
+                }
+            }
+        } catch {
+            errorMessage = "Sync failed: \(error.localizedDescription)"
+        }
+    }
+
     /// Sync against the configured JMAP server. For each known mailbox we
     /// prefer Email/changes (when a sync-state cursor exists) and fall back
     /// to pullRecent — which itself seeds the cursor for next time.
-    func refreshLiveMail() async {
+    private func refreshLiveMailJMAP() async {
         guard let cfg = JMAPConfigStore.first(),
               let url = URL(string: cfg.sessionURL),
               let store else {

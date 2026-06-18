@@ -219,6 +219,88 @@ public actor IMAPClient {
         }
     }
 
+    // MARK: - Flag writes (UID STORE)
+
+    /// Add or remove an IMAP system flag on a single message by UID.
+    /// `keyword` is the literal flag with backslash, e.g. "\Seen", "\Flagged".
+    public func setFlag(uid: Int64, keyword: String, add: Bool) async throws {
+        let op = add ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
+        let resp = try await wire.send(
+            tag: nextTag(),
+            command: "UID STORE \(uid) \(op) (\(keyword))"
+        )
+        guard resp.isOK else { throw IMAPError.commandFailed(resp.resultText) }
+    }
+
+    public func setSeen(uid: Int64, _ seen: Bool) async throws {
+        try await setFlag(uid: uid, keyword: "\\Seen", add: seen)
+    }
+
+    public func setFlagged(uid: Int64, _ flagged: Bool) async throws {
+        try await setFlag(uid: uid, keyword: "\\Flagged", add: flagged)
+    }
+
+    // MARK: - IDLE push
+
+    public enum IdleEvent: Sendable {
+        /// Server announced a new EXISTS count. Trigger an incremental sync.
+        case exists(Int)
+        /// Server announced an EXPUNGE (sequence number deleted).
+        case expunge(Int)
+        /// Heartbeat / other untagged. Useful for "connection still alive".
+        case heartbeat(String)
+        case disconnected(String)
+    }
+
+    /// Stream IDLE events from the currently selected folder. RFC 2177
+    /// recommends ending the IDLE every ≤29 minutes — the consumer
+    /// can re-call this method on a timer to satisfy that.
+    public nonisolated func idle() -> AsyncThrowingStream<IdleEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    try await self.runIdle { event in
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func runIdle(emit: @Sendable (IdleEvent) -> Void) async throws {
+        // We can't reuse send() — IDLE doesn't return a tagged completion
+        // until the client sends DONE. Talk to the wire directly for it.
+        let tag = nextTag()
+        try await wire.sendRawCommand("\(tag) IDLE\r\n")
+        // Wait for the "+ idling" continuation.
+        let ack = try await wire.readUntaggedOrContinuation()
+        guard ack.hasPrefix("+") else {
+            throw IMAPError.protocolError("expected + idling, got \(ack)")
+        }
+        // Pump untagged lines until cancel.
+        while !Task.isCancelled {
+            let line = try await wire.readUntaggedOrContinuation()
+            if line.hasPrefix("*") {
+                let body = line.dropFirst(2)
+                if body.hasSuffix(" EXISTS"),
+                   let n = Int(body.dropLast(" EXISTS".count)) {
+                    emit(.exists(n))
+                } else if body.hasSuffix(" EXPUNGE"),
+                          let n = Int(body.dropLast(" EXPUNGE".count)) {
+                    emit(.expunge(n))
+                } else {
+                    emit(.heartbeat(String(body)))
+                }
+            }
+        }
+        // Caller cancelled — send DONE, then read the tagged completion.
+        try await wire.sendRawCommand("DONE\r\n")
+        _ = try? await wire.readUntilTagged(tag: tag)
+    }
+
     // MARK: - Helpers
 
     private func nextTag() -> String {

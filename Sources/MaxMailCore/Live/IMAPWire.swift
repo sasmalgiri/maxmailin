@@ -148,6 +148,31 @@ public actor IMAPConnection {
         }
     }
 
+    // MARK: - IDLE-friendly raw I/O
+
+    /// Send a raw command line. Used by IDLE which can't share the
+    /// tagged send()/await flow because the server keeps the connection
+    /// in IDLE state until the client sends DONE.
+    public func sendRawCommand(_ command: String) async throws {
+        try ensureConnected()
+        try await write(Data(command.utf8))
+    }
+
+    /// Read one line (untagged or `+` continuation) without waiting for a
+    /// tagged completion. Used by the IDLE pump loop.
+    public func readUntaggedOrContinuation() async throws -> String {
+        try await readTextLine()
+    }
+
+    /// Read lines until we see the named tag's completion. Used by IDLE
+    /// to consume the final OK after DONE.
+    public func readUntilTagged(tag: String) async throws -> String {
+        while true {
+            let line = try await readTextLine()
+            if line.hasPrefix("\(tag) ") { return line }
+        }
+    }
+
     // MARK: - Low-level read
 
     /// Read until CRLF, transparently consuming any inline {n}-style

@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 7
+    private static let schemaVersion: Int64 = 8
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -288,6 +288,24 @@ public actor MailStore {
                 }
 
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '7');")
+            }
+        }
+
+        if current < 8 {
+            // IMAP local row ↔ (folder, UIDVALIDITY, UID) map. UIDs are
+            // only meaningful within a (folder, UIDVALIDITY) scope per
+            // RFC 3501 §2.3.1.1, so the unique key carries both.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS imap_message_map (
+                    local_id     INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    folder_id    INTEGER NOT NULL REFERENCES folders(id)  ON DELETE CASCADE,
+                    uid_validity INTEGER NOT NULL,
+                    uid          INTEGER NOT NULL,
+                    UNIQUE(folder_id, uid_validity, uid)
+                );
+                """)
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '8');")
             }
         }
     }
@@ -765,6 +783,67 @@ public actor MailStore {
             return false
         }
         return result
+    }
+
+    // MARK: - IMAP id mapping
+
+    /// Record (localRowID ↔ folder UID) for an IMAP-fetched message so
+    /// later flag writes can target it via UID STORE. uidValidity guards
+    /// against the server reshuffling its UID space.
+    public func linkIMAP(
+        localRowID: Int64,
+        folderID: Int64,
+        uidValidity: Int64,
+        uid: Int64
+    ) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO imap_message_map(local_id, folder_id, uid_validity, uid)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(local_id) DO UPDATE SET
+            folder_id    = excluded.folder_id,
+            uid_validity = excluded.uid_validity,
+            uid          = excluded.uid;
+        """)
+        try stmt.bind(1, localRowID)
+        try stmt.bind(2, folderID)
+        try stmt.bind(3, uidValidity)
+        try stmt.bind(4, uid)
+        try stmt.run()
+    }
+
+    public struct IMAPMapping: Sendable {
+        public let folderPath: String
+        public let uidValidity: Int64
+        public let uid: Int64
+    }
+
+    public func imapMapping(forLocalRowID localRowID: Int64) throws -> IMAPMapping? {
+        let stmt = try conn.prepare("""
+        SELECT f.path, m.uid_validity, m.uid
+          FROM imap_message_map m
+          JOIN folders f ON f.id = m.folder_id
+         WHERE m.local_id = ?;
+        """)
+        try stmt.bind(1, localRowID)
+        var result: IMAPMapping?
+        try stmt.forEachRow { row in
+            result = IMAPMapping(
+                folderPath: row.string(0) ?? "",
+                uidValidity: row.int64(1),
+                uid: row.int64(2)
+            )
+            return false
+        }
+        return result
+    }
+
+    public func folderIDLookup(accountID: Int64, folder: String) throws -> Int64? {
+        let stmt = try conn.prepare("SELECT id FROM folders WHERE account_id = ? AND path = ?;")
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, folder)
+        var id: Int64 = 0
+        try stmt.forEachRow { row in id = row.int64(0); return false }
+        return id == 0 ? nil : id
     }
 
     public func syncState(accountID: Int64, scope: String) throws -> String? {
