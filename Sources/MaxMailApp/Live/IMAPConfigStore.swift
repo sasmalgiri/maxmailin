@@ -12,9 +12,15 @@ public struct IMAPConfigStore {
         public let username: String
         public let password: String
         public let senderEmail: String
+        // SMTP submission (port 465 implicit TLS for first cut). Same
+        // credentials are reused — Gmail/iCloud/Outlook all accept one
+        // app password for both IMAP and SMTP.
+        public let smtpHost: String
+        public let smtpPort: UInt16
 
         public init(displayName: String, host: String, port: UInt16, useTLS: Bool,
-                    username: String, password: String, senderEmail: String) {
+                    username: String, password: String, senderEmail: String,
+                    smtpHost: String, smtpPort: UInt16) {
             self.displayName = displayName
             self.host = host
             self.port = port
@@ -22,6 +28,8 @@ public struct IMAPConfigStore {
             self.username = username
             self.password = password
             self.senderEmail = senderEmail
+            self.smtpHost = smtpHost
+            self.smtpPort = smtpPort
         }
     }
 
@@ -41,9 +49,20 @@ public struct IMAPConfigStore {
                 useTLS: meta.useTLS,
                 username: meta.username,
                 password: pwd,
-                senderEmail: meta.senderEmail
+                senderEmail: meta.senderEmail,
+                smtpHost: meta.smtpHost ?? defaultSMTPHost(for: meta.host),
+                smtpPort: meta.smtpPort ?? 465
             )
         }
+    }
+
+    /// "imap.gmail.com" → "smtp.gmail.com" — a sensible default when the
+    /// caller didn't fill in the SMTP host explicitly.
+    private static func defaultSMTPHost(for imapHost: String) -> String {
+        if imapHost.hasPrefix("imap.") {
+            return "smtp." + imapHost.dropFirst("imap.".count)
+        }
+        return imapHost
     }
 
     public static func first() -> StoredConfig? { all().first }
@@ -53,7 +72,8 @@ public struct IMAPConfigStore {
         let meta = Metadata(
             displayName: cfg.displayName,
             host: cfg.host, port: cfg.port, useTLS: cfg.useTLS,
-            username: cfg.username, senderEmail: cfg.senderEmail
+            username: cfg.username, senderEmail: cfg.senderEmail,
+            smtpHost: cfg.smtpHost, smtpPort: cfg.smtpPort
         )
         if let idx = metas.firstIndex(where: { $0.displayName == cfg.displayName }) {
             metas[idx] = meta
@@ -80,6 +100,10 @@ public struct IMAPConfigStore {
         let useTLS: Bool
         let username: String
         let senderEmail: String
+        // Optional because pre-v2 metadata didn't carry them — we derive
+        // sensible defaults at read time when nil.
+        let smtpHost: String?
+        let smtpPort: UInt16?
     }
 
     private static func loadMetadata() -> [Metadata] {

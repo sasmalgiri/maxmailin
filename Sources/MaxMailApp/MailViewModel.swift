@@ -286,10 +286,8 @@ final class MailViewModel {
 
     // MARK: - Compose + send
 
-    /// Send the current draft through the saved JMAP config. Threading
-    /// headers come from the draft when this is a reply. Returns the
-    /// server-assigned email id on success, or nil if anything failed —
-    /// in which case `sendError` carries the user-visible message.
+    /// Send the current draft. Dispatches to JMAP submission when a JMAP
+    /// account is configured, falling back to SMTP otherwise.
     func sendCurrentDraft() async -> String? {
         sendError = nil
         let recipients = draftTo
@@ -297,12 +295,23 @@ final class MailViewModel {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         guard !recipients.isEmpty else { sendError = "No recipients"; return nil }
+        if JMAPConfigStore.first() != nil {
+            return await sendCurrentDraftJMAP(recipients: recipients)
+        }
+        if IMAPConfigStore.first() != nil {
+            return await sendCurrentDraftSMTP(recipients: recipients)
+        }
+        sendError = "No mail account configured"
+        return nil
+    }
+
+    private func sendCurrentDraftJMAP(recipients: [String]) async -> String? {
         guard let cfg = JMAPConfigStore.first(),
-              let url = URL(string: cfg.sessionURL) else {
+              let url = URL(string: cfg.sessionURL),
+              let store else {
             sendError = "No JMAP account configured"
             return nil
         }
-        guard let store else { sendError = "Store not ready"; return nil }
         isSending = true
         sendStatus = "Connecting…"
         defer { isSending = false }
@@ -315,17 +324,52 @@ final class MailViewModel {
             let sync = JMAPSync(client: client, store: store, localAccountID: accID)
             sendStatus = "Sending…"
             let id = try await sync.sendPlainEmail(
-                from: cfg.senderEmail,
-                to: recipients,
-                subject: draftSubject,
-                body: draftBody,
-                inReplyTo: draftInReplyTo,
-                references: draftReferences
+                from: cfg.senderEmail, to: recipients,
+                subject: draftSubject, body: draftBody,
+                inReplyTo: draftInReplyTo, references: draftReferences
             )
             sendStatus = "Sent."
             lastSentEmailID = id
             clearDraft()
             return id
+        } catch {
+            sendError = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func sendCurrentDraftSMTP(recipients: [String]) async -> String? {
+        guard let cfg = IMAPConfigStore.first() else {
+            sendError = "No IMAP account configured"
+            return nil
+        }
+        isSending = true
+        sendStatus = "Connecting…"
+        defer { isSending = false }
+        do {
+            let smtp = SMTPClient(config: SMTPConfig(
+                host: cfg.smtpHost, port: cfg.smtpPort, useTLS: true,
+                username: cfg.username, password: cfg.password
+            ))
+            try await smtp.connect()
+            sendStatus = "Authenticating…"
+            try await smtp.authLogin()
+            sendStatus = "Sending…"
+            let messageID = "<\(UUID().uuidString)@maxmailin.local>"
+            let queued = try await smtp.send(SMTPClient.OutboundMessage(
+                from: cfg.senderEmail,
+                to: recipients,
+                subject: draftSubject,
+                plainBody: draftBody,
+                messageID: messageID,
+                inReplyTo: draftInReplyTo,
+                references: draftReferences
+            ))
+            await smtp.disconnect()
+            sendStatus = "Sent."
+            lastSentEmailID = queued
+            clearDraft()
+            return messageID
         } catch {
             sendError = error.localizedDescription
             return nil

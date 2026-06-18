@@ -15,6 +15,8 @@ struct IMAPSettingsView: View {
     @State private var username = ""
     @State private var password = ""
     @State private var senderEmail = ""
+    @State private var smtpHost = "smtp.gmail.com"
+    @State private var smtpPort: String = "465"
 
     @State private var isTesting = false
     @State private var testResult: String?
@@ -34,10 +36,17 @@ struct IMAPSettingsView: View {
                     TextField("Sender email", text: $senderEmail)
                         .textContentType(.emailAddress)
                 }
-                Section("Server") {
+                Section("IMAP server (incoming)") {
                     TextField("Host", text: $host)
                     TextField("Port", text: $port).frame(maxWidth: 100)
                     Toggle("TLS (recommended)", isOn: $useTLS)
+                }
+                Section("SMTP server (outgoing)") {
+                    TextField("Host", text: $smtpHost)
+                    TextField("Port", text: $smtpPort).frame(maxWidth: 100)
+                    Text("Port 465 is implicit-TLS SMTPS. STARTTLS on port 587 is on the roadmap; for now most providers (Gmail / iCloud / Outlook / Fastmail) accept 465.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Section("Credentials") {
                     TextField("Username", text: $username)
@@ -68,7 +77,9 @@ struct IMAPSettingsView: View {
                         useTLS: useTLS,
                         username: username,
                         password: password,
-                        senderEmail: senderEmail
+                        senderEmail: senderEmail,
+                        smtpHost: smtpHost,
+                        smtpPort: UInt16(smtpPort) ?? 465
                     ))
                     dismiss()
                 }
@@ -87,6 +98,8 @@ struct IMAPSettingsView: View {
                 username = existing.username
                 password = existing.password
                 senderEmail = existing.senderEmail
+                smtpHost = existing.smtpHost
+                smtpPort = String(existing.smtpPort)
             }
         }
     }
