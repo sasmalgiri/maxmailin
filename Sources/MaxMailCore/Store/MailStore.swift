@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 9
+    private static let schemaVersion: Int64 = 10
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -341,6 +341,29 @@ public actor MailStore {
                 );
                 """)
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '9');")
+            }
+        }
+
+        if current < 10 {
+            // HMAC-chained audit log. Each entry's hash is HMAC(payload ||
+            // previous_entry_hash) keyed by a per-installation secret; the
+            // chain makes silent tampering detectable across the whole log.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurred_at   INTEGER NOT NULL,
+                    actor         TEXT NOT NULL,
+                    action        TEXT NOT NULL,
+                    subject_kind  TEXT NOT NULL,
+                    subject_id    TEXT NOT NULL,
+                    details_json  TEXT NOT NULL,
+                    prev_hash     TEXT NOT NULL,
+                    entry_hash    TEXT NOT NULL
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_log(subject_kind, subject_id);")
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '10');")
             }
         }
     }
@@ -1504,6 +1527,107 @@ public actor MailStore {
         try upd.bind(1, fid)
         try upd.bind(2, messageRowID)
         try upd.run()
+    }
+
+    // MARK: - Audit log
+
+    public func lastAuditEntryHash() throws -> String? {
+        let stmt = try conn.prepare("""
+        SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1;
+        """)
+        var out: String?
+        try stmt.forEachRow { row in out = row.string(0); return false }
+        return out
+    }
+
+    @discardableResult
+    public func appendAuditEntry(
+        occurredAt: Int64, actor: String, action: String,
+        subjectKind: String, subjectID: String, detailsJSON: String,
+        prevHash: String, entryHash: String
+    ) throws -> Int64 {
+        let stmt = try conn.prepare("""
+        INSERT INTO audit_log(
+            occurred_at, actor, action,
+            subject_kind, subject_id, details_json,
+            prev_hash, entry_hash
+        ) VALUES (?,?,?, ?,?,?, ?,?)
+        RETURNING id;
+        """)
+        try stmt.bind(1, occurredAt)
+        try stmt.bind(2, actor)
+        try stmt.bind(3, action)
+        try stmt.bind(4, subjectKind)
+        try stmt.bind(5, subjectID)
+        try stmt.bind(6, detailsJSON)
+        try stmt.bind(7, prevHash)
+        try stmt.bind(8, entryHash)
+        var newID: Int64 = 0
+        try stmt.forEachRow { row in newID = row.int64(0); return false }
+        return newID
+    }
+
+    public func auditEntries(limit: Int) throws -> [AuditEntry] {
+        let stmt = try conn.prepare("""
+        SELECT id, occurred_at, actor, action,
+               subject_kind, subject_id, details_json, prev_hash, entry_hash
+          FROM audit_log
+         ORDER BY id DESC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, Int64(limit))
+        return try collectAuditRows(stmt)
+    }
+
+    public func auditEntriesInOrder() throws -> [AuditEntry] {
+        let stmt = try conn.prepare("""
+        SELECT id, occurred_at, actor, action,
+               subject_kind, subject_id, details_json, prev_hash, entry_hash
+          FROM audit_log
+         ORDER BY id ASC;
+        """)
+        return try collectAuditRows(stmt)
+    }
+
+    private func collectAuditRows(_ stmt: SQLiteStatement) throws -> [AuditEntry] {
+        var out: [AuditEntry] = []
+        try stmt.forEachRow { row in
+            let detailsJSON = row.string(6) ?? ""
+            // Reverse the canonical "k1=v1;k2=v2" format used by the
+            // audit log so verify() sees the same input on read-back.
+            var details: [String: String] = [:]
+            for pair in detailsJSON.split(separator: ";") {
+                let kv = pair.split(separator: "=", maxSplits: 1)
+                if kv.count == 2 {
+                    details[String(kv[0])] = String(kv[1])
+                } else if kv.count == 1 {
+                    details[String(kv[0])] = ""
+                }
+            }
+            out.append(AuditEntry(
+                id: row.int64(0),
+                occurredAt: Date(timeIntervalSince1970: TimeInterval(row.int64(1))),
+                actor: row.string(2) ?? "",
+                action: row.string(3) ?? "",
+                subjectKind: row.string(4) ?? "",
+                subjectID: row.string(5) ?? "",
+                details: details,
+                prevHash: row.string(7) ?? "",
+                entryHash: row.string(8) ?? ""
+            ))
+            return true
+        }
+        return out
+    }
+
+    /// Test-only helper that overwrites the `actor` column of an existing
+    /// audit row without recomputing its hash. Used to simulate external
+    /// tampering for chain-verification tests. Not part of any user flow.
+    public func _testOverwriteAuditActor(rowID: Int64, newActor: String) throws {
+        let stmt = try conn.prepare("UPDATE audit_log SET actor = ? WHERE id = ?;")
+        try stmt.bind(1, newActor)
+        try stmt.bind(2, rowID)
+        try stmt.run()
     }
 
     // MARK: - Stats
