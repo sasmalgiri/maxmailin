@@ -72,4 +72,107 @@ final class ForensicCoordinator {
         }
         return .makeDefault(store: store)
     }
+
+    // MARK: - Case bundle export
+
+    /// Write `audit.csv` + `BatesIndex.csv` into `bundleRoot` and seal
+    /// them under one signed manifest. Used by the Forensic settings
+    /// pane's "Export full case bundle" button. A bundle produced this
+    /// way is the artifact you'd hand over for end-of-matter archival.
+    /// Records its own `case_bundle_exported` audit entry.
+    func exportFullCaseBundle(
+        store: MailStore,
+        actor: String,
+        bundleName: String,
+        bundleRoot: URL
+    ) async throws {
+        try FileManager.default.createDirectory(
+            at: bundleRoot, withIntermediateDirectories: true
+        )
+
+        // Audit CSV — every chain entry, not just custody kinds.
+        let entries = try await auditLog.entries(limit: 1_000_000)
+        let auditCSV = Self.renderAuditCSV(entries)
+        let auditURL = bundleRoot.appendingPathComponent("audit.csv")
+        try Data(auditCSV.utf8).write(to: auditURL, options: .atomic)
+
+        // Bates index — every assignment ordered by sequence.
+        let batesRows = try await store.batesIndexRows()
+        let batesCSV = Self.renderBatesCSV(batesRows)
+        let batesURL = bundleRoot.appendingPathComponent("BatesIndex.csv")
+        try Data(batesCSV.utf8).write(to: batesURL, options: .atomic)
+
+        let sealed = try await exportSigner.seal(
+            actor: actor,
+            bundleName: bundleName,
+            files: [
+                .init(relativePath: "audit.csv", url: auditURL),
+                .init(relativePath: "BatesIndex.csv", url: batesURL)
+            ]
+        )
+        try sealed.manifestJSON.write(
+            to: bundleRoot.appendingPathComponent("manifest.json"),
+            options: .atomic
+        )
+        try Data(sealed.signatureHex.utf8).write(
+            to: bundleRoot.appendingPathComponent("manifest.sig"),
+            options: .atomic
+        )
+
+        _ = try await auditLog.record(
+            actor: actor,
+            action: "case_bundle_exported",
+            subjectKind: "bundle",
+            subjectID: bundleName,
+            details: [
+                "audit_rows": String(entries.count),
+                "bates_rows": String(batesRows.count)
+            ]
+        )
+    }
+
+    private static func renderAuditCSV(_ entries: [AuditEntry]) -> String {
+        var out = "ID,Timestamp,Actor,Action,SubjectKind,SubjectID,PrevHash,EntryHash\n"
+        let iso = ISO8601DateFormatter()
+        for e in entries.reversed() {
+            out += [
+                String(e.id),
+                iso.string(from: e.occurredAt),
+                csvField(e.actor),
+                csvField(e.action),
+                csvField(e.subjectKind),
+                csvField(e.subjectID),
+                e.prevHash,
+                e.entryHash
+            ].joined(separator: ",") + "\n"
+        }
+        return out
+    }
+
+    private static func renderBatesCSV(_ rows: [MailStore.BatesIndexRow]) -> String {
+        var out = "BatesNumber,Sequence,From,To,Subject,Date,MessageID,AssignedAt\n"
+        let iso = ISO8601DateFormatter()
+        for r in rows {
+            out += [
+                csvField(r.batesNumber),
+                String(r.sequence),
+                csvField(r.fromAddress),
+                csvField(r.toAddresses),
+                csvField(r.subject),
+                iso.string(from: r.date),
+                csvField(r.messageID),
+                iso.string(from: r.assignedAt)
+            ].joined(separator: ",") + "\n"
+        }
+        return out
+    }
+
+    private static func csvField(_ text: String) -> String {
+        var v = text.replacingOccurrences(of: "\"", with: "\"\"")
+        if let first = v.first, "=+@-\t\r".contains(first) { v = "'" + v }
+        if v.contains(",") || v.contains("\"") || v.contains("\n") {
+            return "\"\(v)\""
+        }
+        return v
+    }
 }
