@@ -38,6 +38,12 @@ final class MailViewModel {
     var currentForensics: ForensicResult?
     var currentAnomalies: [EmailAnomaly] = []
 
+    // Custody / forensic state for the currently selected message.
+    var currentMessageSeal: (sealedAt: Date, sha256Hex: String)?
+    var currentMessageBates: String?
+    var custodyStatus: String?
+    var isCustodyBusy: Bool = false
+
     var searchText: String = ""
     var searchResults: [SearchHit] = []
     var isSearching: Bool = false
@@ -183,7 +189,11 @@ final class MailViewModel {
         currentNLP = nil
         currentForensics = nil
         currentAnomalies = []
+        currentMessageSeal = nil
+        currentMessageBates = nil
+        custodyStatus = nil
         guard let store else { return }
+        await loadCustodyStatus(for: rowID)
         do {
             let body = try await store.loadBody(messageRowID: rowID)
             let atts = try await store.attachments(messageRowID: rowID)
@@ -232,6 +242,92 @@ final class MailViewModel {
         searchText = ""
         searchResults = []
         isSearching = false
+    }
+
+    // MARK: - Custody actions
+
+    /// Refresh seal + Bates state for the currently selected message so
+    /// the detail toolbar shows the right chips. Called from
+    /// `selectMessage`; cheap (two indexed reads), so it doesn't run on
+    /// a background task.
+    func loadCustodyStatus(for rowID: Int64) async {
+        guard let store else { return }
+        let seal = try? await store.messageSeal(messageRowID: rowID)
+        let bates = try? await store.batesAssignment(messageRowID: rowID)?.batesNumber
+        if selectedMessageID == rowID {
+            currentMessageSeal = seal
+            currentMessageBates = bates
+        }
+    }
+
+    /// Identity recorded on every audit entry. Uses the account address
+    /// when one is selected; falls back to a generic "examiner" so the
+    /// chain never has an empty actor (the audit canonicalisation
+    /// distinguishes empty from missing, but downstream readers find
+    /// "examiner" much clearer than "").
+    private var custodyActorName: String {
+        selectedAccount?.address ?? "examiner"
+    }
+
+    func sealCurrentMessage() async {
+        guard let forensic, let rowID = selectedMessageID else { return }
+        isCustodyBusy = true
+        defer { isCustodyBusy = false }
+        do {
+            let report = try await forensic.custody.sealMessages(
+                rowIDs: [rowID], actor: custodyActorName
+            )
+            custodyStatus = report.newlySealed > 0
+                ? "Sealed at \(Self.formatTimeNow())"
+                : "Already sealed"
+            await loadCustodyStatus(for: rowID)
+        } catch {
+            custodyStatus = "Seal failed: \(error.localizedDescription)"
+        }
+    }
+
+    func verifyCurrentMessage() async {
+        guard let forensic, let rowID = selectedMessageID else { return }
+        isCustodyBusy = true
+        defer { isCustodyBusy = false }
+        do {
+            let v = try await forensic.custody.verifyMessages(
+                rowIDs: [rowID], actor: custodyActorName
+            )
+            if v.unsealed.contains(rowID) {
+                custodyStatus = "Not sealed yet — seal first"
+            } else if !v.drifted.isEmpty {
+                custodyStatus = "Tampered — content has changed since seal"
+            } else {
+                custodyStatus = "Verified at \(Self.formatTimeNow())"
+            }
+        } catch {
+            custodyStatus = "Verify failed: \(error.localizedDescription)"
+        }
+    }
+
+    func recordCustodyEvent(kind: CustodyEventKind, description: String) async {
+        guard let forensic, let rowID = selectedMessageID else { return }
+        isCustodyBusy = true
+        defer { isCustodyBusy = false }
+        do {
+            _ = try await forensic.custody.recordEvent(
+                kind: kind,
+                actor: custodyActorName,
+                subjectKind: "message",
+                subjectID: String(rowID),
+                description: description
+            )
+            custodyStatus = "\(kind.rawValue) recorded"
+        } catch {
+            custodyStatus = "Failed to record: \(error.localizedDescription)"
+        }
+    }
+
+    private static func formatTimeNow() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date())
     }
 
     // MARK: - Analytics + background NLP

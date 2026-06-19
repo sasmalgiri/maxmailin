@@ -16,6 +16,7 @@ struct MessageDetailView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     headerBlock
                     replyToolbar
+                    custodyToolbar
                     if !model.currentAnomalies.isEmpty {
                         AnomalyChipsView(anomalies: model.currentAnomalies)
                     }
@@ -52,6 +53,91 @@ struct MessageDetailView: View {
             )
         }
         return nil
+    }
+
+    /// Custody actions for the currently selected message. The whole row
+    /// is hidden when the ForensicCoordinator failed to initialise (which
+    /// only happens if MailStore itself failed to open) so we don't show
+    /// dead buttons.
+    @ViewBuilder private var custodyToolbar: some View {
+        if model.forensic != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await model.sealCurrentMessage() }
+                    } label: {
+                        Label("Seal", systemImage: "lock.shield")
+                    }
+                    .disabled(model.isCustodyBusy || model.currentMessageSeal != nil)
+
+                    Button {
+                        Task { await model.verifyCurrentMessage() }
+                    } label: {
+                        Label("Verify", systemImage: "checkmark.seal")
+                    }
+                    .disabled(model.isCustodyBusy || model.currentMessageSeal == nil)
+
+                    Menu {
+                        Button("Tag as Evidence") {
+                            Task {
+                                await model.recordCustodyEvent(
+                                    kind: .taggedAsEvidence,
+                                    description: "Tagged from detail view"
+                                )
+                            }
+                        }
+                        Button("Mark Privileged") {
+                            Task {
+                                await model.recordCustodyEvent(
+                                    kind: .markedPrivileged,
+                                    description: "Marked privileged from detail view"
+                                )
+                            }
+                        }
+                        Button("Record Access") {
+                            Task {
+                                await model.recordCustodyEvent(
+                                    kind: .accessed,
+                                    description: "Opened in review"
+                                )
+                            }
+                        }
+                    } label: {
+                        Label("Custody…", systemImage: "ellipsis.circle")
+                    }
+                    .disabled(model.isCustodyBusy)
+
+                    if let bates = model.currentMessageBates {
+                        Label(bates, systemImage: "number.square")
+                            .font(.caption)
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.12),
+                                        in: Capsule())
+                    }
+                    if let seal = model.currentMessageSeal {
+                        Label {
+                            Text("Sealed \(seal.sealedAt, format: .dateTime.month().day().hour().minute())")
+                                .font(.caption)
+                        } icon: {
+                            Image(systemName: "lock.shield.fill")
+                                .foregroundStyle(.green)
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Color.green.opacity(0.10), in: Capsule())
+                        .help("SHA-256: \(seal.sha256Hex)")
+                    }
+                    Spacer()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                if let status = model.custodyStatus {
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     @ViewBuilder private var replyToolbar: some View {
