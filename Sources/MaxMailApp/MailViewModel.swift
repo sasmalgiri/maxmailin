@@ -19,6 +19,10 @@ struct FolderSummary: Identifiable, Hashable {
 @Observable
 final class MailViewModel {
     var store: MailStore?
+    /// HMAC-chained audit log + Bates / custody / GDPR engines, bound to
+    /// the open store. Built once the store is open in `bootstrap`; nil
+    /// only between launch and the first successful bootstrap.
+    var forensic: ForensicCoordinator?
     var accounts: [AccountSummary] = []
     var selectedAccount: AccountSummary?
 
@@ -100,6 +104,7 @@ final class MailViewModel {
             let url = Self.defaultDBURL()
             let s = try MailStore(url: url)
             self.store = s
+            self.forensic = ForensicCoordinator.makeDefault(store: s)
             statusMessage = "Ready"
             await refreshAccountsAndFolders()
             await loadHeaders()
