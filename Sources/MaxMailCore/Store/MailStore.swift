@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 11
+    private static let schemaVersion: Int64 = 12
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -382,6 +382,33 @@ public actor MailStore {
                 );
                 """)
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '11');")
+            }
+        }
+
+        if current < 12 {
+            // Bates numbering for legal production. Each message that's been
+            // produced gets a permanent sequential identifier under a fixed
+            // prefix; once assigned a number cannot change without breaking
+            // citations in court filings. The sequence column is the raw
+            // integer (assigned in chronological order); bates_number is the
+            // pre-formatted "PREFIX000123" string we render.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS bates_config (
+                    key    TEXT PRIMARY KEY,
+                    value  TEXT NOT NULL
+                );
+                """)
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS bates_assignments (
+                    message_id    INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    sequence      INTEGER NOT NULL UNIQUE,
+                    bates_number  TEXT    NOT NULL UNIQUE,
+                    assigned_at   INTEGER NOT NULL
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_bates_sequence ON bates_assignments(sequence);")
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '12');")
             }
         }
     }
@@ -1747,6 +1774,181 @@ public actor MailStore {
             return false
         }
         return out
+    }
+
+    // MARK: - Bates numbering
+
+    public struct BatesAssignmentRow: Sendable {
+        public let messageRowID: Int64
+        public let sequence: Int64
+        public let batesNumber: String
+        public let assignedAt: Date
+    }
+
+    /// Read a Bates config value. Caller decides defaults; keeping the
+    /// table value-keyed lets the schema stay stable across config drift.
+    public func batesConfigValue(forKey key: String) throws -> String? {
+        let stmt = try conn.prepare("SELECT value FROM bates_config WHERE key = ?;")
+        try stmt.bind(1, key)
+        var out: String?
+        try stmt.forEachRow { row in out = row.string(0); return false }
+        return out
+    }
+
+    public func setBatesConfigValue(_ value: String, forKey key: String) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO bates_config(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """)
+        try stmt.bind(1, key)
+        try stmt.bind(2, value)
+        try stmt.run()
+    }
+
+    /// All messages in chronological order (oldest first), only including
+    /// rows that don't yet carry a Bates number. Used for assignment passes:
+    /// re-running assignment only stamps new arrivals and never re-stamps
+    /// already-numbered exhibits.
+    public func unnumberedMessageRowIDsInChronologicalOrder(
+        accountID: Int64? = nil, limit: Int = 100_000
+    ) throws -> [Int64] {
+        let sql: String
+        if accountID != nil {
+            sql = """
+            SELECT m.id FROM messages m
+             LEFT JOIN bates_assignments b ON b.message_id = m.id
+             WHERE b.message_id IS NULL AND m.account_id = ?
+             ORDER BY m.date_unix ASC, m.id ASC
+             LIMIT ?;
+            """
+        } else {
+            sql = """
+            SELECT m.id FROM messages m
+             LEFT JOIN bates_assignments b ON b.message_id = m.id
+             WHERE b.message_id IS NULL
+             ORDER BY m.date_unix ASC, m.id ASC
+             LIMIT ?;
+            """
+        }
+        let stmt = try conn.prepare(sql)
+        if let accountID {
+            try stmt.bind(1, accountID)
+            try stmt.bind(2, Int64(limit))
+        } else {
+            try stmt.bind(1, Int64(limit))
+        }
+        var out: [Int64] = []
+        try stmt.forEachRow { row in
+            out.append(row.int64(0))
+            return true
+        }
+        return out
+    }
+
+    public func batesAssignment(messageRowID: Int64) throws -> BatesAssignmentRow? {
+        let stmt = try conn.prepare("""
+        SELECT message_id, sequence, bates_number, assigned_at
+          FROM bates_assignments WHERE message_id = ?;
+        """)
+        try stmt.bind(1, messageRowID)
+        var out: BatesAssignmentRow?
+        try stmt.forEachRow { row in
+            out = BatesAssignmentRow(
+                messageRowID: row.int64(0),
+                sequence: row.int64(1),
+                batesNumber: row.string(2) ?? "",
+                assignedAt: Date(timeIntervalSince1970: TimeInterval(row.int64(3)))
+            )
+            return false
+        }
+        return out
+    }
+
+    /// Highest assigned sequence number, or 0 when no Bates numbers exist.
+    /// New batches append starting from `maxAssignedBatesSequence + 1`.
+    public func maxAssignedBatesSequence() throws -> Int64 {
+        let stmt = try conn.prepare("SELECT COALESCE(MAX(sequence), 0) FROM bates_assignments;")
+        var out: Int64 = 0
+        try stmt.forEachRow { row in out = row.int64(0); return false }
+        return out
+    }
+
+    /// Bulk-insert Bates rows under one transaction. Sequence and bates
+    /// number are caller-supplied so the manager controls formatting and
+    /// numbering policy; the store just persists. Throws on duplicate
+    /// sequence or duplicate bates_number — both are unique by design.
+    public func bulkInsertBatesAssignments(_ rows: [BatesAssignmentRow]) throws {
+        guard !rows.isEmpty else { return }
+        try conn.transaction {
+            let stmt = try conn.prepare("""
+            INSERT INTO bates_assignments(message_id, sequence, bates_number, assigned_at)
+            VALUES (?, ?, ?, ?);
+            """)
+            for r in rows {
+                stmt.reset()
+                try stmt.bind(1, r.messageRowID)
+                try stmt.bind(2, r.sequence)
+                try stmt.bind(3, r.batesNumber)
+                try stmt.bind(4, Int64(r.assignedAt.timeIntervalSince1970))
+                try stmt.run()
+            }
+        }
+    }
+
+    public func batesAssignmentCount() throws -> Int64 {
+        let stmt = try conn.prepare("SELECT COUNT(*) FROM bates_assignments;")
+        var n: Int64 = 0
+        try stmt.forEachRow { row in n = row.int64(0); return false }
+        return n
+    }
+
+    /// All Bates rows ordered by sequence ascending, joined with the
+    /// minimal message header projection needed for the CSV index export.
+    public struct BatesIndexRow: Sendable {
+        public let batesNumber: String
+        public let sequence: Int64
+        public let messageID: String
+        public let fromAddress: String
+        public let toAddresses: String
+        public let subject: String
+        public let date: Date
+        public let assignedAt: Date
+    }
+
+    public func batesIndexRows(limit: Int = 100_000) throws -> [BatesIndexRow] {
+        let stmt = try conn.prepare("""
+        SELECT b.bates_number, b.sequence, b.assigned_at,
+               m.message_id, m.from_addr, m.to_addrs, m.subject, m.date_unix
+          FROM bates_assignments b
+          JOIN messages m ON m.id = b.message_id
+         ORDER BY b.sequence ASC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, Int64(limit))
+        var out: [BatesIndexRow] = []
+        try stmt.forEachRow { row in
+            out.append(BatesIndexRow(
+                batesNumber: row.string(0) ?? "",
+                sequence: row.int64(1),
+                messageID: row.string(3) ?? "",
+                fromAddress: row.string(4) ?? "",
+                toAddresses: row.string(5) ?? "",
+                subject: row.string(6) ?? "",
+                date: Date(timeIntervalSince1970: TimeInterval(row.int64(7))),
+                assignedAt: Date(timeIntervalSince1970: TimeInterval(row.int64(2)))
+            ))
+            return true
+        }
+        return out
+    }
+
+    /// Wipe every Bates assignment. Manager records an audit entry before
+    /// calling so the rationale is captured even though the rows are gone.
+    @discardableResult
+    public func removeAllBatesAssignments() throws -> Int64 {
+        let count = try batesAssignmentCount()
+        try conn.exec("DELETE FROM bates_assignments;")
+        return count
     }
 
     /// Returns message rowIDs in `candidates` that don't yet have a seal.
