@@ -1951,6 +1951,105 @@ public actor MailStore {
         return count
     }
 
+    // MARK: - GDPR data-subject queries
+
+    public struct GDPRMessageRef: Sendable {
+        public let messageRowID: Int64
+        public let messageID: String
+        public let subject: String
+        public let fromAddress: String
+        public let toAddresses: String
+        public let ccAddresses: String
+        public let date: Date
+        public let folder: String
+        public let hasAttachments: Bool
+    }
+
+    /// Every message that has `emailAddress` in its `from`, `to`, or `cc`
+    /// columns. The LIKE wildcard is intentional: address columns are stored
+    /// as either bare addresses or display-name + angle-bracketed addresses,
+    /// so substring matching catches both shapes. Body / Bcc are *not*
+    /// scanned here — that's a separate slower scan via FTS the caller can
+    /// run if they need it. Returns the rows newest-first.
+    public func findMessagesInvolving(
+        emailAddress: String,
+        accountID: Int64? = nil,
+        limit: Int = 100_000
+    ) throws -> [GDPRMessageRef] {
+        let needle = "%\(emailAddress)%"
+        let whereAccount = accountID == nil ? "" : "AND m.account_id = ? "
+        let sql = """
+        SELECT m.id, m.message_id, m.subject,
+               m.from_addr, m.to_addrs, m.cc_addrs,
+               m.date_unix, f.path,
+               EXISTS(SELECT 1 FROM attachments a WHERE a.message_id = m.id)
+          FROM messages m
+          JOIN folders  f ON f.id = m.folder_id
+         WHERE (m.from_addr LIKE ?
+             OR m.to_addrs LIKE ?
+             OR m.cc_addrs LIKE ?)
+           \(whereAccount)
+         ORDER BY m.date_unix DESC, m.id DESC
+         LIMIT ?;
+        """
+        let stmt = try conn.prepare(sql)
+        try stmt.bind(1, needle)
+        try stmt.bind(2, needle)
+        try stmt.bind(3, needle)
+        if let accountID {
+            try stmt.bind(4, accountID)
+            try stmt.bind(5, Int64(limit))
+        } else {
+            try stmt.bind(4, Int64(limit))
+        }
+
+        var out: [GDPRMessageRef] = []
+        try stmt.forEachRow { row in
+            out.append(GDPRMessageRef(
+                messageRowID: row.int64(0),
+                messageID: row.string(1) ?? "",
+                subject: row.string(2) ?? "",
+                fromAddress: row.string(3) ?? "",
+                toAddresses: row.string(4) ?? "",
+                ccAddresses: row.string(5) ?? "",
+                date: Date(timeIntervalSince1970: TimeInterval(row.int64(6))),
+                folder: row.string(7) ?? "",
+                hasAttachments: row.int(8) != 0
+            ))
+            return true
+        }
+        return out
+    }
+
+    /// Sum every `PIIFinding.count` across every `message_forensics` row in
+    /// `messageRowIDs`, grouped by PII kind. Used by the GDPR report to roll
+    /// the per-message forensic results up into a subject-level inventory.
+    /// Skips rows that don't have forensics yet — the report should call
+    /// `ensureForensics` for missing ones upstream.
+    public func aggregatePIICounts(forMessageRowIDs ids: [Int64]) throws -> [PIIFinding.Kind: Int] {
+        guard !ids.isEmpty else { return [:] }
+        var totals: [PIIFinding.Kind: Int] = [:]
+        let chunkSize = 500
+        for start in stride(from: 0, to: ids.count, by: chunkSize) {
+            let end = min(start + chunkSize, ids.count)
+            let chunk = Array(ids[start..<end])
+            let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+            let stmt = try conn.prepare("""
+            SELECT pii_json FROM message_forensics
+             WHERE message_id IN (\(placeholders));
+            """)
+            for (i, id) in chunk.enumerated() { try stmt.bind(Int32(i + 1), id) }
+            try stmt.forEachRow { row in
+                let pii: [PIIFinding] = self.decodeJSON(row.string(0)) ?? []
+                for finding in pii {
+                    totals[finding.kind, default: 0] += finding.count
+                }
+                return true
+            }
+        }
+        return totals
+    }
+
     /// Returns message rowIDs in `candidates` that don't yet have a seal.
     /// Used by `ChainOfCustodyManager.sealMessages` to skip already-sealed
     /// rows without forcing the caller to round-trip per id.
