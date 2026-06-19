@@ -93,6 +93,8 @@ struct ContentView: View {
                     Divider()
                     Button("Rules…")          { model.showRules = true }
                     Button("Security…")       { model.showSecurity = true }
+                    Divider()
+                    Button("Forensic Center…") { model.showForensicCenter = true }
                 } label: {
                     Label("Accounts", systemImage: "gearshape")
                 }
@@ -127,6 +129,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $bindable.showSecurity) {
             SecuritySettingsView()
+        }
+        .sheet(isPresented: $bindable.showForensicCenter) {
+            ForensicCenterView().environment(model)
         }
         .overlay {
             if model.isLocked {

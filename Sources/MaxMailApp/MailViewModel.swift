@@ -78,6 +78,7 @@ final class MailViewModel {
     var showCommandPalette: Bool = false
     var showRules: Bool = false
     var showSecurity: Bool = false
+    var showForensicCenter: Bool = false
     var isLocked: Bool = false
     private var lastBackgroundedAt: Date?
 
