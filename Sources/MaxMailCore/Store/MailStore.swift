@@ -2149,6 +2149,102 @@ public actor MailStore {
         return (total, unread)
     }
 
+    // MARK: - Cross-cutting case-report aggregations
+
+    /// Total + by-level distribution of phishing findings across an
+    /// account. Aggregates the indexed `phishing_level` column on
+    /// `message_forensics` so cost stays O(matching rows) regardless of
+    /// total corpus size. Returns counts keyed by raw level string
+    /// ("none"/"low"/"medium"/"high"); callers decode into
+    /// `PhishingFinding.RiskLevel`. Messages without forensics rows are
+    /// not counted — caller is expected to drive `ensureForensics`
+    /// upstream if comprehensive numbers are needed.
+    public func phishingDistribution(accountID: Int64) throws -> [String: Int64] {
+        let stmt = try conn.prepare("""
+        SELECT mf.phishing_level, COUNT(*)
+          FROM message_forensics mf
+          JOIN messages m ON m.id = mf.message_id
+         WHERE m.account_id = ?
+         GROUP BY mf.phishing_level;
+        """)
+        try stmt.bind(1, accountID)
+        var out: [String: Int64] = [:]
+        try stmt.forEachRow { row in
+            let level = row.string(0) ?? "none"
+            out[level] = row.int64(1)
+            return true
+        }
+        return out
+    }
+
+    /// Monthly message volume across an account. Keys are "YYYY-MM";
+    /// counts are messages dated in that month. Cheap because the
+    /// month grouping uses the same date_unix index that backs the
+    /// pagination queries, and the result set is bounded by the
+    /// account's date range (~tens of rows for typical inboxes).
+    public func monthlyMessageVolume(accountID: Int64) throws -> [(month: String, count: Int64)] {
+        let stmt = try conn.prepare("""
+        SELECT strftime('%Y-%m', date_unix, 'unixepoch') AS m, COUNT(*)
+          FROM messages
+         WHERE account_id = ?
+         GROUP BY m
+         ORDER BY m ASC;
+        """)
+        try stmt.bind(1, accountID)
+        var out: [(String, Int64)] = []
+        try stmt.forEachRow { row in
+            let m = row.string(0) ?? ""
+            if !m.isEmpty {
+                out.append((m, row.int64(1)))
+            }
+            return true
+        }
+        return out
+    }
+
+    /// First / last assigned Bates numbers + count. Returns nil when
+    /// no assignments exist. Used by the InvestigationReportGenerator
+    /// to put the production range on the case header. Ordering is by
+    /// `sequence` rather than lexical compare on bates_number — if a
+    /// padding change ever lands mid-corpus, lexical MIN/MAX would
+    /// disagree with the actual issue order.
+    public func batesAssignmentRange() throws -> (first: String, last: String, count: Int64)? {
+        let cnt = try batesAssignmentCount()
+        guard cnt > 0 else { return nil }
+        var first = "", last = ""
+        let firstStmt = try conn.prepare(
+            "SELECT bates_number FROM bates_assignments ORDER BY sequence ASC LIMIT 1;"
+        )
+        try firstStmt.forEachRow { row in first = row.string(0) ?? ""; return false }
+        let lastStmt = try conn.prepare(
+            "SELECT bates_number FROM bates_assignments ORDER BY sequence DESC LIMIT 1;"
+        )
+        try lastStmt.forEachRow { row in last = row.string(0) ?? ""; return false }
+        return (first, last, cnt)
+    }
+
+    /// Every message rowID for an account, chronological (oldest
+    /// first), capped at `limit`. Used by case-report and analytics
+    /// aggregators that need to enumerate over messages without loading
+    /// headers. Strictly read-only; the result is a flat [Int64] so the
+    /// caller can pass it into chunked IN-list aggregators.
+    public func messageRowIDs(accountID: Int64, limit: Int = 500_000) throws -> [Int64] {
+        let stmt = try conn.prepare("""
+        SELECT id FROM messages
+         WHERE account_id = ?
+         ORDER BY date_unix ASC, id ASC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [Int64] = []
+        try stmt.forEachRow { row in
+            out.append(row.int64(0))
+            return true
+        }
+        return out
+    }
+
     public func isJMAPLinked(messageRowID: Int64) throws -> Bool {
         return try jmapEmailID(forLocalRowID: messageRowID) != nil
     }
