@@ -2223,6 +2223,47 @@ public actor MailStore {
         return (first, last, cnt)
     }
 
+    // MARK: - Correspondents (entity-resolution input)
+
+    public struct CorrespondentRow: Sendable {
+        public let rawHeaderValue: String   // e.g. "Alice <alex@acme.com>"
+        public let messageCount: Int64
+        public init(rawHeaderValue: String, messageCount: Int64) {
+            self.rawHeaderValue = rawHeaderValue
+            self.messageCount = messageCount
+        }
+    }
+
+    /// Enumerate distinct sender values across an account, descending by
+    /// occurrence count. The shape returned here is intentionally
+    /// pre-normalisation — EntityResolver runs *over* these rows, so
+    /// the store layer doesn't lock in any one resolution policy.
+    /// Recipients are not included; from_addr is the only column that
+    /// carries the canonical sender identity per row.
+    public func distinctCorrespondents(
+        accountID: Int64, limit: Int = 5_000
+    ) throws -> [CorrespondentRow] {
+        let stmt = try conn.prepare("""
+        SELECT from_addr, COUNT(*) AS c
+          FROM messages
+         WHERE account_id = ? AND from_addr != ''
+         GROUP BY from_addr
+         ORDER BY c DESC, from_addr ASC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, Int64(limit))
+        var out: [CorrespondentRow] = []
+        try stmt.forEachRow { row in
+            out.append(CorrespondentRow(
+                rawHeaderValue: row.string(0) ?? "",
+                messageCount: row.int64(1)
+            ))
+            return true
+        }
+        return out
+    }
+
     // MARK: - Duplicate detection
 
     /// One cluster of (subject, from) duplicates plus the affected rows.
