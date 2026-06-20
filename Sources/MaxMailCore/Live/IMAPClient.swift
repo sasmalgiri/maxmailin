@@ -66,6 +66,46 @@ public actor IMAPClient {
         loggedIn = true
     }
 
+    /// SASL XOAUTH2 — Gmail / Microsoft 365 / Yahoo modern auth.
+    /// `accessToken` is a current bearer token from the provider's
+    /// OAuth flow (refresh is the caller's responsibility via
+    /// OAuthTokenProvider). The initial response is sent inline per
+    /// RFC 7628 so the happy path completes in one round-trip.
+    ///
+    /// On failure the server sends `+ <base64-error>` to ask us for
+    /// an empty acknowledgement, then replies tagged NO. We send the
+    /// empty line and surface `IMAPError.authFailed` with the
+    /// resultText so the UI can prompt for re-auth.
+    public func authXOAUTH2(accessToken: String) async throws {
+        let sasl = XOAUTH2.saslInitialResponse(
+            username: config.username, accessToken: accessToken
+        )
+        let tag = nextTag()
+        try await wire.sendRawCommand("\(tag) AUTHENTICATE XOAUTH2 \(sasl)\r\n")
+        // Server either sends a tagged completion (success) or a `+ ...`
+        // continuation asking for an empty line on failure. The wire's
+        // higher-level send() swallows `+` lines, so we drive this
+        // exchange against the raw read path.
+        while true {
+            let line = try await wire.readUntaggedOrContinuation()
+            if line.hasPrefix("\(tag) ") {
+                let rest = line.dropFirst(tag.count + 1)
+                if rest.hasPrefix("OK") {
+                    loggedIn = true
+                    return
+                }
+                throw IMAPError.authFailed(String(rest))
+            }
+            if line.hasPrefix("+") {
+                // Acknowledge the failure continuation so the server
+                // can issue the tagged NO with a real error message.
+                try await wire.sendRawCommand("\r\n")
+                continue
+            }
+            // Untagged informational line; loop until we see the tag.
+        }
+    }
+
     public func disconnect() async {
         if loggedIn {
             _ = try? await wire.send(tag: nextTag(), command: "LOGOUT")

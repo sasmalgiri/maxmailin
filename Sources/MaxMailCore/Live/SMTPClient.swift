@@ -134,6 +134,31 @@ public actor SMTPClient {
         try await sendBase64Line(config.password, expectCode: 235)
     }
 
+    /// SASL XOAUTH2 — Gmail / Microsoft 365 / Yahoo modern auth.
+    /// On success the server replies 235 directly. On failure it
+    /// replies 334 with a base64 JSON error blob expecting an empty
+    /// continuation line, then the tagged failure (typically 535).
+    public func authXOAUTH2(accessToken: String) async throws {
+        let sasl = XOAUTH2.saslInitialResponse(
+            username: config.username, accessToken: accessToken
+        )
+        try ensureConnected()
+        try await writeRaw(Data("AUTH XOAUTH2 \(sasl)\r\n".utf8))
+        let resp = try await readResponse()
+        switch resp.code {
+        case 235:
+            return
+        case 334:
+            // Acknowledge the failure continuation; then the next
+            // response will be the real 5xx with the human message.
+            try await writeRaw(Data("\r\n".utf8))
+            let final = try await readResponse()
+            throw SMTPError.authFailed("\(final.code) \(final.message)")
+        default:
+            throw SMTPError.authFailed("\(resp.code) \(resp.message)")
+        }
+    }
+
     private func sendBase64Line(_ s: String, expectCode: Int) async throws {
         let encoded = Data(s.utf8).base64EncodedString()
         try await sendCommand(encoded, expectCode: expectCode)
