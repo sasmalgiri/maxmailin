@@ -1,5 +1,4 @@
 import Foundation
-import Network
 
 public enum SMTPError: Error, LocalizedError, Sendable {
     case notConnected
@@ -19,34 +18,66 @@ public enum SMTPError: Error, LocalizedError, Sendable {
     }
 }
 
+/// How SMTP wraps the connection in TLS.
+///   - `.implicit` — TLS starts at the TCP layer, before any SMTP I/O.
+///     Conventional port is 465 (SMTPS).
+///   - `.startTLS`  — Plain-text dial, EHLO, STARTTLS command, then
+///     `URLSessionStreamTask.startSecureConnection()` upgrades the
+///     *same* socket to TLS per RFC 3207. Conventional port is 587.
+///   - `.plaintext` — No TLS. Only for development against a local
+///     relay; never for the public internet.
+public enum SMTPEncryption: Sendable, Equatable {
+    case implicit
+    case startTLS
+    case plaintext
+}
+
 public struct SMTPConfig: Sendable {
     public var host: String
-    public var port: UInt16        // 465 implicit TLS recommended
-    public var useTLS: Bool
+    public var port: UInt16
+    public var encryption: SMTPEncryption
     public var username: String
     public var password: String
 
-    public init(host: String, port: UInt16 = 465, useTLS: Bool = true,
+    /// Designated init.
+    public init(host: String, port: UInt16 = 465,
+                encryption: SMTPEncryption = .implicit,
                 username: String, password: String) {
         self.host = host
         self.port = port
-        self.useTLS = useTLS
+        self.encryption = encryption
         self.username = username
         self.password = password
     }
+
+    /// Backwards-compatible init for callers still passing the
+    /// pre-STARTTLS `useTLS: Bool` shape. True → implicit TLS,
+    /// false → plaintext. Callers that want STARTTLS must move to
+    /// the encryption-aware init.
+    public init(host: String, port: UInt16 = 465, useTLS: Bool,
+                username: String, password: String) {
+        self.init(
+            host: host, port: port,
+            encryption: useTLS ? .implicit : .plaintext,
+            username: username, password: password
+        )
+    }
 }
 
-/// Outbound SMTP client. Implicit TLS (port 465 / SMTPS) for first cut —
-/// no STARTTLS upgrade dance. Most modern servers (Gmail / iCloud /
-/// Outlook / Fastmail / Stalwart) support 465.
+/// Outbound SMTP client. Built on `URLSessionStreamTask` so we can
+/// support both implicit TLS (port 465) and STARTTLS (port 587) on top
+/// of one wire layer — `startSecureConnection()` does the mid-stream
+/// TLS upgrade on the same underlying socket, which is what RFC 3207
+/// requires (close-and-reopen-with-TLS would defeat the security
+/// guarantee).
 ///
 /// Streaming discipline: send bodies are written in one shot (typical
-/// outbound mail is small kB scale). If we ever need to stream a multi-GB
-/// attachment, the same chunked-write pattern from IMAPWire applies.
+/// outbound mail is small kB scale). Multi-GB sends would need a
+/// chunked write loop the same as IMAPWire uses.
 public actor SMTPClient {
 
     public let config: SMTPConfig
-    private var connection: NWConnection?
+    private var task: URLSessionStreamTask?
     private var rxBuffer = Data()
 
     public init(config: SMTPConfig) {
@@ -56,27 +87,15 @@ public actor SMTPClient {
     // MARK: - Lifecycle
 
     public func connect() async throws {
-        let params: NWParameters = config.useTLS ? .tls : .tcp
-        let endpoint = NWEndpoint.hostPort(
-            host: .init(config.host),
-            port: NWEndpoint.Port(rawValue: config.port) ?? 465
+        let task = URLSession.shared.streamTask(
+            withHostName: config.host, port: Int(config.port)
         )
-        let conn = NWConnection(to: endpoint, using: params)
-        self.connection = conn
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var resumed = false
-            conn.stateUpdateHandler = { state in
-                guard !resumed else { return }
-                switch state {
-                case .ready: resumed = true; cont.resume()
-                case .failed(let e): resumed = true
-                    cont.resume(throwing: SMTPError.connectionFailed(e.localizedDescription))
-                case .cancelled: resumed = true
-                    cont.resume(throwing: SMTPError.connectionFailed("cancelled"))
-                default: break
-                }
-            }
-            conn.start(queue: .global(qos: .userInitiated))
+        task.resume()
+        self.task = task
+
+        // Implicit TLS: handshake before any SMTP bytes flow.
+        if config.encryption == .implicit {
+            task.startSecureConnection()
         }
 
         // Server greeting: "220 ..."
@@ -84,14 +103,23 @@ public actor SMTPClient {
         guard greeting.code == 220 else {
             throw SMTPError.protocolError("greeting was \(greeting.code) \(greeting.message)")
         }
-        // EHLO to enter ESMTP mode.
         try await sendCommand("EHLO maxmailin.local", expectCode: 250)
+
+        // STARTTLS upgrade dance (RFC 3207). The post-TLS EHLO is
+        // mandatory — server capabilities can differ between
+        // pre-encryption and post-encryption sessions.
+        if config.encryption == .startTLS {
+            try await sendCommand("STARTTLS", expectCode: 220)
+            task.startSecureConnection()
+            try await sendCommand("EHLO maxmailin.local", expectCode: 250)
+        }
     }
 
     public func disconnect() async {
         _ = try? await sendCommand("QUIT", expectCode: 221)
-        connection?.cancel()
-        connection = nil
+        task?.closeWrite()
+        task?.cancel()
+        task = nil
         rxBuffer.removeAll(keepingCapacity: false)
     }
 
@@ -264,9 +292,10 @@ public actor SMTPClient {
     }
 
     private func receiveMore() async throws {
-        guard let conn = connection else { throw SMTPError.notConnected }
+        guard let task = task else { throw SMTPError.notConnected }
         let data: Data = try await withCheckedThrowingContinuation { cont in
-            conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, _, error in
+            task.readData(ofMinLength: 1, maxLength: 64 * 1024, timeout: 30) {
+                data, _, error in
                 if let error {
                     cont.resume(throwing: SMTPError.connectionFailed(error.localizedDescription))
                 } else {
@@ -281,19 +310,19 @@ public actor SMTPClient {
     }
 
     private func writeRaw(_ data: Data) async throws {
-        guard let conn = connection else { throw SMTPError.notConnected }
+        guard let task = task else { throw SMTPError.notConnected }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            conn.send(content: data, completion: .contentProcessed { error in
+            task.write(data, timeout: 30) { error in
                 if let error {
                     cont.resume(throwing: SMTPError.connectionFailed(error.localizedDescription))
                 } else {
                     cont.resume()
                 }
-            })
+            }
         }
     }
 
     private func ensureConnected() throws {
-        guard connection != nil else { throw SMTPError.notConnected }
+        guard task != nil else { throw SMTPError.notConnected }
     }
 }

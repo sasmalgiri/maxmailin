@@ -55,6 +55,33 @@ final class SMTPTests: XCTestCase {
         XCTAssertTrue(text.contains("References: <m0@x> <m1@x>"))
     }
 
+    func testSMTPConfigEncryptionDefaultsToImplicitOn465() {
+        let cfg = SMTPConfig(host: "smtp.example.com",
+                             username: "u", password: "p")
+        XCTAssertEqual(cfg.encryption, .implicit)
+        XCTAssertEqual(cfg.port, 465)
+    }
+
+    func testSMTPConfigStartTLSPathIsRepresentable() {
+        let cfg = SMTPConfig(
+            host: "smtp.example.com", port: 587,
+            encryption: .startTLS,
+            username: "u", password: "p"
+        )
+        XCTAssertEqual(cfg.encryption, .startTLS)
+        XCTAssertEqual(cfg.port, 587)
+    }
+
+    func testSMTPConfigUseTLSShimMapsToImplicitAndPlaintext() {
+        // Backwards-compat init still compiles and round-trips correctly.
+        let tls = SMTPConfig(host: "h", port: 465, useTLS: true,
+                             username: "u", password: "p")
+        let plain = SMTPConfig(host: "h", port: 25, useTLS: false,
+                               username: "u", password: "p")
+        XCTAssertEqual(tls.encryption, .implicit)
+        XCTAssertEqual(plain.encryption, .plaintext)
+    }
+
     func testSMTPSendBeforeConnectErrors() async {
         let smtp = SMTPClient(config: SMTPConfig(
             host: "smtp.example.com",
