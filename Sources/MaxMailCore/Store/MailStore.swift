@@ -2223,6 +2223,86 @@ public actor MailStore {
         return (first, last, cnt)
     }
 
+    // MARK: - Duplicate detection
+
+    /// One cluster of (subject, from) duplicates plus the affected rows.
+    /// Rows are date-ascending so callers can pick the oldest as the
+    /// canonical and delete the rest.
+    public struct DuplicateCluster: Sendable, Hashable {
+        public let subject: String
+        public let fromAddress: String
+        public let messageRowIDs: [Int64]
+        public init(subject: String, fromAddress: String, messageRowIDs: [Int64]) {
+            self.subject = subject
+            self.fromAddress = fromAddress
+            self.messageRowIDs = messageRowIDs
+        }
+        public var count: Int { messageRowIDs.count }
+    }
+
+    /// Find duplicate clusters across an account by (subject, from)
+    /// pair. SQL-driven so it stays cheap at 10M-message scale —
+    /// GROUP BY runs on the existing (account_id, date) covering
+    /// scan and lazily emits only clusters with > 1 row. The result
+    /// excludes empty subjects to avoid one giant "no subject"
+    /// cluster swamping the UI.
+    ///
+    /// `limit` caps the number of clusters returned; rowsPerCluster
+    /// caps the per-cluster row enumeration. Both default to bounded
+    /// values so an absurdly-duplicated account doesn't OOM the
+    /// caller before they can pick a strategy.
+    public func duplicateClusters(
+        accountID: Int64,
+        limit: Int = 200,
+        rowsPerCluster: Int = 50
+    ) throws -> [DuplicateCluster] {
+        // 1. Find candidate (subject, from) pairs with > 1 row.
+        let pairStmt = try conn.prepare("""
+        SELECT subject, from_addr, COUNT(*) AS c
+          FROM messages
+         WHERE account_id = ? AND subject != ''
+         GROUP BY subject, from_addr
+        HAVING c > 1
+         ORDER BY c DESC, subject ASC
+         LIMIT ?;
+        """)
+        try pairStmt.bind(1, accountID)
+        try pairStmt.bind(2, Int64(limit))
+        var pairs: [(String, String)] = []
+        try pairStmt.forEachRow { row in
+            pairs.append((row.string(0) ?? "", row.string(1) ?? ""))
+            return true
+        }
+
+        // 2. For each pair, enumerate the row ids oldest-first.
+        var out: [DuplicateCluster] = []
+        out.reserveCapacity(pairs.count)
+        let detailStmt = try conn.prepare("""
+        SELECT id FROM messages
+         WHERE account_id = ? AND subject = ? AND from_addr = ?
+         ORDER BY date_unix ASC, id ASC
+         LIMIT ?;
+        """)
+        for (subject, from) in pairs {
+            detailStmt.reset()
+            try detailStmt.bind(1, accountID)
+            try detailStmt.bind(2, subject)
+            try detailStmt.bind(3, from)
+            try detailStmt.bind(4, Int64(rowsPerCluster))
+            var rowIDs: [Int64] = []
+            try detailStmt.forEachRow { row in
+                rowIDs.append(row.int64(0))
+                return true
+            }
+            if rowIDs.count > 1 {
+                out.append(DuplicateCluster(
+                    subject: subject, fromAddress: from, messageRowIDs: rowIDs
+                ))
+            }
+        }
+        return out
+    }
+
     /// Every message rowID for an account, chronological (oldest
     /// first), capped at `limit`. Used by case-report and analytics
     /// aggregators that need to enumerate over messages without loading
