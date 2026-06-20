@@ -252,14 +252,15 @@ public actor IMAPClient {
         case disconnected(String)
     }
 
-    /// Stream IDLE events from the currently selected folder. RFC 2177
-    /// recommends ending the IDLE every ≤29 minutes — the consumer
-    /// can re-call this method on a timer to satisfy that.
+    /// Stream IDLE events from the currently selected folder. Single
+    /// IDLE window; caller is responsible for re-issuing it before the
+    /// server timeout. For long-lived push, use `idleWithAutoRestart`
+    /// which handles the RFC 2177 ≤29-minute refresh internally.
     public nonisolated func idle() -> AsyncThrowingStream<IdleEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
-                    try await self.runIdle { event in
+                    try await self.runIdleWindow(restartAfter: nil) { event in
                         continuation.yield(event)
                     }
                     continuation.finish()
@@ -267,10 +268,50 @@ public actor IMAPClient {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
-    private func runIdle(emit: @Sendable (IdleEvent) -> Void) async throws {
+    /// Long-lived IDLE push with automatic re-issue. Every
+    /// `restartAfter` seconds we send DONE, read the server's tagged
+    /// completion, and immediately open a fresh IDLE — so the
+    /// connection never sits idle long enough to hit RFC 2177's
+    /// 29-minute ceiling. The consumer sees a single continuous event
+    /// stream across the rolling windows.
+    ///
+    /// Cancellation: cancelling the iteration (e.g. `for-await` task
+    /// goes away) cancels the inner Task, which in turn fires a final
+    /// DONE so the server-side IDLE state closes cleanly rather than
+    /// being torn down with the connection.
+    public nonisolated func idleWithAutoRestart(
+        restartAfter: TimeInterval = 28 * 60
+    ) -> AsyncThrowingStream<IdleEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    while !Task.isCancelled {
+                        try await self.runIdleWindow(restartAfter: restartAfter) { event in
+                            continuation.yield(event)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// One IDLE window. When `restartAfter` is non-nil, a side task
+    /// fires DONE after that many seconds (or as soon as the
+    /// surrounding Task is cancelled, whichever comes first) so the
+    /// window closes cleanly. The main loop reads lines until it sees
+    /// the IDLE's own tagged completion, then returns.
+    private func runIdleWindow(
+        restartAfter: TimeInterval?,
+        emit: @Sendable (IdleEvent) -> Void
+    ) async throws {
         // We can't reuse send() — IDLE doesn't return a tagged completion
         // until the client sends DONE. Talk to the wire directly for it.
         let tag = nextTag()
@@ -280,9 +321,27 @@ public actor IMAPClient {
         guard ack.hasPrefix("+") else {
             throw IMAPError.protocolError("expected + idling, got \(ack)")
         }
-        // Pump untagged lines until cancel.
-        while !Task.isCancelled {
+
+        // Terminator task: sleeps until the window closes, then fires
+        // DONE. If the surrounding Task gets cancelled, `try? await
+        // Task.sleep` returns immediately and we still send DONE so the
+        // server-side IDLE state isn't orphaned.
+        let wireRef = wire
+        let terminator: Task<Void, Never>? = restartAfter.map { interval in
+            Task {
+                let ns = UInt64(max(interval, 1) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: ns)
+                try? await wireRef.sendRawCommand("DONE\r\n")
+            }
+        }
+        defer { terminator?.cancel() }
+
+        while true {
             let line = try await wire.readUntaggedOrContinuation()
+            if line.hasPrefix("\(tag) ") {
+                // Server acknowledged DONE — this IDLE window is over.
+                return
+            }
             if line.hasPrefix("*") {
                 let body = line.dropFirst(2)
                 if body.hasSuffix(" EXISTS"),
@@ -295,10 +354,16 @@ public actor IMAPClient {
                     emit(.heartbeat(String(body)))
                 }
             }
+            // For the bounded-window case the terminator drives DONE.
+            // For the open-ended `idle()` case, surface caller
+            // cancellation here so the wire doesn't read forever after
+            // the consumer goes away.
+            if restartAfter == nil, Task.isCancelled {
+                try await wire.sendRawCommand("DONE\r\n")
+                _ = try? await wire.readUntilTagged(tag: tag)
+                return
+            }
         }
-        // Caller cancelled — send DONE, then read the tagged completion.
-        try await wire.sendRawCommand("DONE\r\n")
-        _ = try? await wire.readUntilTagged(tag: tag)
     }
 
     // MARK: - Helpers
