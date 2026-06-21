@@ -171,7 +171,7 @@ public actor SMTPClient {
         public init(_ address: String) { self.address = address }
     }
 
-    public struct OutboundMessage: Sendable {
+    public struct OutboundMessage: Sendable, Codable, Equatable {
         public let from: String
         public let to: [String]
         public let cc: [String]

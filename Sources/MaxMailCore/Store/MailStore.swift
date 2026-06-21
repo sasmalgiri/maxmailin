@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 13
+    private static let schemaVersion: Int64 = 14
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -427,6 +427,32 @@ public actor MailStore {
                 """)
                 try conn.exec("CREATE INDEX IF NOT EXISTS idx_snoozed_until ON snoozed_messages(snoozed_until);")
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '13');")
+            }
+        }
+
+        if current < 14 {
+            // Outbox — scheduled outbound messages that the app's send
+            // pump picks up when their send_at <= now. The status
+            // string drives lifecycle ("pending" → "sending" → "sent"
+            // or "failed"); attempts + last_error give the UI enough
+            // signal to render "Failed twice — retry?" without a
+            // separate audit table.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS outbox (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id    INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    payload_json  TEXT    NOT NULL,
+                    send_at       INTEGER NOT NULL,
+                    status        TEXT    NOT NULL,
+                    attempts      INTEGER NOT NULL DEFAULT 0,
+                    last_error    TEXT,
+                    created_at    INTEGER NOT NULL,
+                    sent_at       INTEGER
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, send_at);")
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '14');")
             }
         }
     }
@@ -2106,6 +2132,182 @@ public actor MailStore {
         try stmt.forEachRow { row in
             out = Date(timeIntervalSince1970: TimeInterval(row.int64(0)))
             return false
+        }
+        return out
+    }
+
+    // MARK: - Outbox (scheduled send)
+
+    public enum OutboxStatus: String, Sendable, Equatable {
+        case pending
+        case sending
+        case sent
+        case failed
+    }
+
+    public struct OutboxEntry: Sendable, Identifiable {
+        public let id: Int64
+        public let accountID: Int64
+        public let message: SMTPClient.OutboundMessage
+        public let sendAt: Date
+        public let status: OutboxStatus
+        public let attempts: Int
+        public let lastError: String?
+        public let createdAt: Date
+        public let sentAt: Date?
+    }
+
+    /// Enqueue an outbound message for delivery at `sendAt`. Returns
+    /// the row id so the UI can show the entry it just created and
+    /// the app's send pump can refer back to it. Pass `sendAt = Date()`
+    /// for "send ASAP" — the pump picks it up on the next tick.
+    @discardableResult
+    public func enqueueOutbox(
+        accountID: Int64,
+        message: SMTPClient.OutboundMessage,
+        sendAt: Date
+    ) throws -> Int64 {
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        let payload = try enc.encode(message)
+        guard let json = String(data: payload, encoding: .utf8) else {
+            throw NSError(domain: "MailStore", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "non-utf8 payload"])
+        }
+        let now = Int64(Date().timeIntervalSince1970)
+        let stmt = try conn.prepare("""
+        INSERT INTO outbox(account_id, payload_json, send_at, status, created_at)
+        VALUES(?, ?, ?, 'pending', ?)
+        RETURNING id;
+        """)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, json)
+        try stmt.bind(3, Int64(sendAt.timeIntervalSince1970))
+        try stmt.bind(4, now)
+        var newID: Int64 = 0
+        try stmt.forEachRow { row in newID = row.int64(0); return false }
+        return newID
+    }
+
+    /// Outbox entries whose send_at has passed and that are still in
+    /// `pending` status. The send pump fetches with this and races to
+    /// claim each via `markOutboxSending`.
+    public func dueOutboxEntries(at when: Date = Date(),
+                                 limit: Int = 50) throws -> [OutboxEntry] {
+        let stmt = try conn.prepare("""
+        SELECT id, account_id, payload_json, send_at, status, attempts, last_error,
+               created_at, sent_at
+          FROM outbox
+         WHERE status = 'pending' AND send_at <= ?
+         ORDER BY send_at ASC, id ASC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, Int64(when.timeIntervalSince1970))
+        try stmt.bind(2, Int64(limit))
+        return try collectOutboxRows(stmt)
+    }
+
+    /// All outbox rows for an account, newest-first. UI uses this to
+    /// render the queue. Capped at `limit` so a giant queue can't
+    /// blow up the panel.
+    public func listOutbox(accountID: Int64? = nil,
+                           limit: Int = 200) throws -> [OutboxEntry] {
+        let sql = accountID == nil
+            ? """
+            SELECT id, account_id, payload_json, send_at, status, attempts, last_error,
+                   created_at, sent_at
+              FROM outbox
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?;
+            """
+            : """
+            SELECT id, account_id, payload_json, send_at, status, attempts, last_error,
+                   created_at, sent_at
+              FROM outbox
+             WHERE account_id = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?;
+            """
+        let stmt = try conn.prepare(sql)
+        if let accountID {
+            try stmt.bind(1, accountID)
+            try stmt.bind(2, Int64(limit))
+        } else {
+            try stmt.bind(1, Int64(limit))
+        }
+        return try collectOutboxRows(stmt)
+    }
+
+    public func markOutboxSending(id: Int64) throws {
+        let stmt = try conn.prepare("""
+        UPDATE outbox SET status = 'sending', attempts = attempts + 1
+         WHERE id = ?;
+        """)
+        try stmt.bind(1, id)
+        try stmt.run()
+    }
+
+    public func markOutboxSent(id: Int64, at when: Date = Date()) throws {
+        let stmt = try conn.prepare("""
+        UPDATE outbox SET status = 'sent', sent_at = ?, last_error = NULL
+         WHERE id = ?;
+        """)
+        try stmt.bind(1, Int64(when.timeIntervalSince1970))
+        try stmt.bind(2, id)
+        try stmt.run()
+    }
+
+    public func markOutboxFailed(id: Int64, error: String) throws {
+        let stmt = try conn.prepare("""
+        UPDATE outbox SET status = 'failed', last_error = ?
+         WHERE id = ?;
+        """)
+        try stmt.bind(1, error)
+        try stmt.bind(2, id)
+        try stmt.run()
+    }
+
+    /// Move a failed row back to pending so the next due tick retries
+    /// it. The previous error is kept on the row so the UI can still
+    /// show what went wrong before.
+    public func retryOutbox(id: Int64) throws {
+        let stmt = try conn.prepare("""
+        UPDATE outbox SET status = 'pending'
+         WHERE id = ?;
+        """)
+        try stmt.bind(1, id)
+        try stmt.run()
+    }
+
+    public func cancelOutbox(id: Int64) throws {
+        let stmt = try conn.prepare("DELETE FROM outbox WHERE id = ? AND status != 'sending';")
+        try stmt.bind(1, id)
+        try stmt.run()
+    }
+
+    private func collectOutboxRows(_ stmt: SQLiteStatement) throws -> [OutboxEntry] {
+        var out: [OutboxEntry] = []
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        try stmt.forEachRow { row in
+            let payload = row.string(2) ?? ""
+            guard let data = payload.data(using: .utf8),
+                  let msg = try? dec.decode(SMTPClient.OutboundMessage.self, from: data)
+            else { return true }
+            let statusRaw = row.string(4) ?? "pending"
+            out.append(OutboxEntry(
+                id: row.int64(0),
+                accountID: row.int64(1),
+                message: msg,
+                sendAt: Date(timeIntervalSince1970: TimeInterval(row.int64(3))),
+                status: OutboxStatus(rawValue: statusRaw) ?? .pending,
+                attempts: row.int(5),
+                lastError: row.string(6),
+                createdAt: Date(timeIntervalSince1970: TimeInterval(row.int64(7))),
+                sentAt: row.isNull(8) ? nil
+                    : Date(timeIntervalSince1970: TimeInterval(row.int64(8)))
+            ))
+            return true
         }
         return out
     }
