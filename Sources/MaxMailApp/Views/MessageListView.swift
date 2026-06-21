@@ -114,6 +114,16 @@ struct MessageListView: View {
             Task { await model.toggleFlagged(rowID: header.id) }
         }
         Divider()
+        Menu("Snooze") {
+            ForEach(SnoozeOption.allCases, id: \.self) { opt in
+                Button {
+                    Task { await model.snooze(rowID: header.id, option: opt) }
+                } label: {
+                    Label(opt.label, systemImage: opt.systemImage)
+                }
+            }
+        }
+        Divider()
         Button("Reply") {
             Task {
                 await model.selectMessage(rowID: header.id)

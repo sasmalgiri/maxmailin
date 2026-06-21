@@ -53,6 +53,10 @@ final class MailViewModel {
     var custodyStatus: String?
     var isCustodyBusy: Bool = false
 
+    /// Snooze wake time for the currently selected message, when one
+    /// is scheduled. The detail-pane chip reads this directly.
+    var currentMessageSnoozeUntil: Date?
+
     var searchText: String = ""
     var searchResults: [SearchHit] = []
     var isSearching: Bool = false
@@ -250,8 +254,10 @@ final class MailViewModel {
         currentMessageSeal = nil
         currentMessageBates = nil
         custodyStatus = nil
+        currentMessageSnoozeUntil = nil
         guard let store else { return }
         await loadCustodyStatus(for: rowID)
+        currentMessageSnoozeUntil = try? await store.snoozeUntil(messageRowID: rowID)
         do {
             let body = try await store.loadBody(messageRowID: rowID)
             let atts = try await store.attachments(messageRowID: rowID)
@@ -300,6 +306,46 @@ final class MailViewModel {
         searchText = ""
         searchResults = []
         isSearching = false
+    }
+
+    // MARK: - Snooze
+
+    /// Hide `rowID` from headers queries until `until`. Caller picks
+    /// the wake time — typically via `SnoozeOption.wakeTime(from:)`
+    /// but a custom time works too. After the snooze lands the page
+    /// is reloaded so the row drops out of the visible list
+    /// immediately.
+    func snooze(rowID: Int64, until: Date) async {
+        guard let store else { return }
+        do {
+            try await store.snoozeMessage(messageRowID: rowID, until: until)
+            if rowID == selectedMessageID {
+                currentMessageSnoozeUntil = until
+            }
+            await loadHeaders()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Convenience for the context-menu quick picks. Forwards through
+    /// to `snooze(rowID:until:)` after resolving the option's wake
+    /// time against `Date()`.
+    func snooze(rowID: Int64, option: SnoozeOption) async {
+        await snooze(rowID: rowID, until: option.wakeTime(from: Date()))
+    }
+
+    func unsnooze(rowID: Int64) async {
+        guard let store else { return }
+        do {
+            try await store.unsnoozeMessage(messageRowID: rowID)
+            if rowID == selectedMessageID {
+                currentMessageSnoozeUntil = nil
+            }
+            await loadHeaders()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Custody actions

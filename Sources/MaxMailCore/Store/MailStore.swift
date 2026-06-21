@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 12
+    private static let schemaVersion: Int64 = 13
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -409,6 +409,24 @@ public actor MailStore {
                 """)
                 try conn.exec("CREATE INDEX IF NOT EXISTS idx_bates_sequence ON bates_assignments(sequence);")
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '12');")
+            }
+        }
+
+        if current < 13 {
+            // Snooze table — hides messages from headers() until the
+            // snoozed_until timestamp passes. Indexed on the wake time
+            // so the periodic "any rows due?" probe stays cheap even
+            // when thousands of snoozes are outstanding.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS snoozed_messages (
+                    message_id      INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    snoozed_until   INTEGER NOT NULL,
+                    snoozed_at      INTEGER NOT NULL
+                );
+                """)
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_snoozed_until ON snoozed_messages(snoozed_until);")
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '13');")
             }
         }
     }
@@ -1003,6 +1021,7 @@ public actor MailStore {
         in folder: String, accountID: Int64,
         before: Date? = nil, limit: Int = 200
     ) throws -> [ThreadableHeader] {
+        let now = Int64(Date().timeIntervalSince1970)
         let sql: String
         if before == nil {
             sql = """
@@ -1010,7 +1029,9 @@ public actor MailStore {
                    m.size_bytes, m.flags, m.snippet,
                    m.in_reply_to, m.references_
               FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
              WHERE f.account_id = ? AND f.path = ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
              ORDER BY m.date_unix DESC, m.id DESC
              LIMIT ?;
             """
@@ -1020,7 +1041,9 @@ public actor MailStore {
                    m.size_bytes, m.flags, m.snippet,
                    m.in_reply_to, m.references_
               FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
              WHERE f.account_id = ? AND f.path = ? AND m.date_unix < ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
              ORDER BY m.date_unix DESC, m.id DESC
              LIMIT ?;
             """
@@ -1030,9 +1053,11 @@ public actor MailStore {
         try stmt.bind(2, folder)
         if let before {
             try stmt.bind(3, Int64(before.timeIntervalSince1970))
-            try stmt.bind(4, Int64(limit))
+            try stmt.bind(4, now)
+            try stmt.bind(5, Int64(limit))
         } else {
-            try stmt.bind(3, Int64(limit))
+            try stmt.bind(3, now)
+            try stmt.bind(4, Int64(limit))
         }
         var out: [ThreadableHeader] = []
         out.reserveCapacity(limit)
@@ -1125,13 +1150,19 @@ public actor MailStore {
     /// Page through a folder, newest-first. `before` is the unix date of the last
     /// row from the previous page — keeps you in keyset-pagination land (no OFFSET).
     public func headers(in folder: String, accountID: Int64, before: Date? = nil, limit: Int = 50) throws -> [MessageHeader] {
+        // Snooze filter: any message with snoozed_until > now hides
+        // from the list until that time. The LEFT JOIN + NULL/<=now
+        // check keeps unsnoozed (and due-already) rows visible.
+        let now = Int64(Date().timeIntervalSince1970)
         let sql: String
         if before == nil {
             sql = """
             SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
                    m.size_bytes, m.flags, m.snippet
               FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
              WHERE f.account_id = ? AND f.path = ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
              ORDER BY m.date_unix DESC, m.id DESC
              LIMIT ?;
             """
@@ -1140,7 +1171,9 @@ public actor MailStore {
             SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
                    m.size_bytes, m.flags, m.snippet
               FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
              WHERE f.account_id = ? AND f.path = ? AND m.date_unix < ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
              ORDER BY m.date_unix DESC, m.id DESC
              LIMIT ?;
             """
@@ -1150,9 +1183,11 @@ public actor MailStore {
         try stmt.bind(2, folder)
         if let before {
             try stmt.bind(3, Int64(before.timeIntervalSince1970))
-            try stmt.bind(4, Int64(limit))
+            try stmt.bind(4, now)
+            try stmt.bind(5, Int64(limit))
         } else {
-            try stmt.bind(3, Int64(limit))
+            try stmt.bind(3, now)
+            try stmt.bind(4, Int64(limit))
         }
 
         var out: [MessageHeader] = []
@@ -2032,6 +2067,47 @@ public actor MailStore {
         let count = try batesAssignmentCount()
         try conn.exec("DELETE FROM bates_assignments;")
         return count
+    }
+
+    // MARK: - Snooze
+
+    /// Hide a message from `headers` queries until `until`. Idempotent;
+    /// re-snoozing rewrites the wake time without touching the
+    /// snoozed_at audit field, so a re-snooze doesn't reset the
+    /// "originally snoozed at" timestamp the UI can show.
+    public func snoozeMessage(messageRowID: Int64, until: Date) throws {
+        let stmt = try conn.prepare("""
+        INSERT INTO snoozed_messages(message_id, snoozed_until, snoozed_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET snoozed_until = excluded.snoozed_until;
+        """)
+        try stmt.bind(1, messageRowID)
+        try stmt.bind(2, Int64(until.timeIntervalSince1970))
+        try stmt.bind(3, Int64(Date().timeIntervalSince1970))
+        try stmt.run()
+    }
+
+    /// Wake a snoozed message immediately. No-op when the row was
+    /// never snoozed.
+    public func unsnoozeMessage(messageRowID: Int64) throws {
+        let stmt = try conn.prepare("DELETE FROM snoozed_messages WHERE message_id = ?;")
+        try stmt.bind(1, messageRowID)
+        try stmt.run()
+    }
+
+    /// Current snooze wake time for a message, or nil if not snoozed.
+    /// Useful for the detail-pane chip — "snoozed until tomorrow 9 AM."
+    public func snoozeUntil(messageRowID: Int64) throws -> Date? {
+        let stmt = try conn.prepare(
+            "SELECT snoozed_until FROM snoozed_messages WHERE message_id = ?;"
+        )
+        try stmt.bind(1, messageRowID)
+        var out: Date?
+        try stmt.forEachRow { row in
+            out = Date(timeIntervalSince1970: TimeInterval(row.int64(0)))
+            return false
+        }
+        return out
     }
 
     // MARK: - GDPR data-subject queries

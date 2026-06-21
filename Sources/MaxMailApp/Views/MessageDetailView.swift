@@ -120,6 +120,22 @@ struct MessageDetailView: View {
                     }
                     .disabled(model.isCustodyBusy)
 
+                    if let until = model.currentMessageSnoozeUntil {
+                        Button {
+                            if let id = model.selectedMessageID {
+                                Task { await model.unsnooze(rowID: id) }
+                            }
+                        } label: {
+                            Label {
+                                Text("Snoozed until \(until, format: .dateTime.month().day().hour().minute())")
+                                    .font(.caption)
+                            } icon: {
+                                Image(systemName: "alarm")
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        .help("Tap to wake the message now")
+                    }
                     if let bates = model.currentMessageBates {
                         Label(bates, systemImage: "number.square")
                             .font(.caption)
