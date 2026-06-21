@@ -17,6 +17,9 @@ struct MessageDetailView: View {
                     headerBlock
                     replyToolbar
                     custodyToolbar
+                    if let invite = model.currentInvite {
+                        InviteCardView(invite: invite)
+                    }
                     if !model.currentAnomalies.isEmpty {
                         AnomalyChipsView(anomalies: model.currentAnomalies)
                     }

@@ -43,6 +43,9 @@ final class MailViewModel {
 
     var currentBody: (plain: String?, html: String?)?
     var currentAttachments: [AttachmentRef] = []
+    /// Parsed calendar invite when the currently-selected message
+    /// carries a text/calendar attachment we can read. nil otherwise.
+    var currentInvite: CalendarInvite?
     var currentNLP: EmailNLP?
     var currentForensics: ForensicResult?
     var currentAnomalies: [EmailAnomaly] = []
@@ -255,6 +258,7 @@ final class MailViewModel {
         currentMessageBates = nil
         custodyStatus = nil
         currentMessageSnoozeUntil = nil
+        currentInvite = nil
         guard let store else { return }
         await loadCustodyStatus(for: rowID)
         currentMessageSnoozeUntil = try? await store.snoozeUntil(messageRowID: rowID)
@@ -263,6 +267,10 @@ final class MailViewModel {
             let atts = try await store.attachments(messageRowID: rowID)
             self.currentBody = body
             self.currentAttachments = atts
+            // Scan for a text/calendar attachment and try to parse —
+            // if it works the detail pane shows the InviteCard. Cheap;
+            // the blob load is O(KB) and the parser is pure Swift.
+            self.currentInvite = await Self.detectInvite(in: atts, store: store)
             // Anomalies are cheap (3 indexed lookups) — compute synchronously.
             self.currentAnomalies = (try? await store.anomalies(forMessageRowID: rowID)) ?? []
             // Kick off NLP + forensics lazily; selection of *another* message
@@ -471,6 +479,27 @@ final class MailViewModel {
         } catch {
             custodyStatus = "Failed to record: \(error.localizedDescription)"
         }
+    }
+
+    /// Walk the attachment list looking for a text/calendar payload
+    /// and parse it. Returns nil when there isn't one or when the
+    /// payload didn't parse (malformed feeds happen).
+    private static func detectInvite(
+        in attachments: [AttachmentRef], store: MailStore
+    ) async -> CalendarInvite? {
+        for att in attachments {
+            let mime = (att.mimeType ?? "").lowercased()
+            guard mime.hasPrefix("text/calendar") else { continue }
+            guard let hex = att.sha256Hex,
+                  let bytes = await store.loadAttachmentData(sha256Hex: hex),
+                  let text = String(data: bytes, encoding: .utf8) else {
+                continue
+            }
+            if let invite = try? ICalendarParser.parse(text) {
+                return invite
+            }
+        }
+        return nil
     }
 
     private static func formatTimeNow() -> String {
