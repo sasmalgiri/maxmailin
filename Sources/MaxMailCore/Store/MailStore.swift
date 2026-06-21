@@ -42,7 +42,7 @@ public actor MailStore {
 
     // MARK: - Schema
 
-    private static let schemaVersion: Int64 = 14
+    private static let schemaVersion: Int64 = 15
 
     private static func migrate(_ conn: SQLiteConnection) throws {
         try conn.exec("""
@@ -455,6 +455,25 @@ public actor MailStore {
                 try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '14');")
             }
         }
+
+        if current < 15 {
+            // Blocked senders — incoming messages from these addresses
+            // route straight to the Spam folder at ingest time and
+            // the explicit "Block sender" UI dumps existing rows from
+            // the offender into Spam as well. Addresses are stored
+            // lower-case so case-folding doesn't have to happen on
+            // every read.
+            try conn.transaction {
+                try conn.exec("""
+                CREATE TABLE IF NOT EXISTS blocked_senders (
+                    address    TEXT PRIMARY KEY,
+                    reason     TEXT,
+                    blocked_at INTEGER NOT NULL
+                );
+                """)
+                try conn.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '15');")
+            }
+        }
     }
 
     /// Discover any old year-grained shard tables that need to be dropped
@@ -782,10 +801,19 @@ public actor MailStore {
         stmts: BulkStatements,
         folderCache: inout [Int64: [String: Int64]]
     ) throws -> Int {
+        // Snapshot the blocklist once per batch so the per-message
+        // routing check stays O(1). Empty when nothing is blocked,
+        // which is the common case — the contains() then short-circuits.
+        let blocked = try blockedAddressSet()
         var inserted = 0
         for (i, m) in messages.enumerated() {
+            let folderName = Self.routedFolder(
+                originalFolder: m.folder,
+                fromAddress: m.fromAddress,
+                blocked: blocked
+            )
             let fid = try folderID(
-                accountID: m.accountID, folder: m.folder,
+                accountID: m.accountID, folder: folderName,
                 selFolderID: stmts.selFolderID, insFolder: stmts.insFolder,
                 cache: &folderCache
             )
@@ -2134,6 +2162,135 @@ public actor MailStore {
             return false
         }
         return out
+    }
+
+    // MARK: - Spam / block sender
+
+    /// Canonical folder name that holds messages from blocked senders
+    /// and anything the user explicitly marks as spam. Created
+    /// lazily on first move — folders are not pre-seeded so accounts
+    /// with no spam interaction never get an empty folder cluttering
+    /// the sidebar.
+    public static let spamFolderName = "Spam"
+
+    public struct BlockedSender: Sendable, Hashable {
+        public let address: String   // lower-cased
+        public let reason: String?
+        public let blockedAt: Date
+    }
+
+    /// Permanently route future mail from this address to the Spam
+    /// folder. The address is lower-cased on the way in so the
+    /// matching at ingest time stays a single SQL lookup.
+    public func blockSender(address: String, reason: String? = nil) throws {
+        let trimmed = address
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !trimmed.isEmpty else { return }
+        let stmt = try conn.prepare("""
+        INSERT INTO blocked_senders(address, reason, blocked_at)
+        VALUES(?, ?, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            reason = excluded.reason,
+            blocked_at = excluded.blocked_at;
+        """)
+        try stmt.bind(1, trimmed)
+        try stmt.bind(2, reason)
+        try stmt.bind(3, Int64(Date().timeIntervalSince1970))
+        try stmt.run()
+    }
+
+    public func unblockSender(address: String) throws {
+        let trimmed = address
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let stmt = try conn.prepare("DELETE FROM blocked_senders WHERE address = ?;")
+        try stmt.bind(1, trimmed)
+        try stmt.run()
+    }
+
+    /// True when the address (or its parsed bare-address form) is on
+    /// the blocklist. Tolerant of `"Alice" <alice@x>` style header
+    /// values so callers don't have to pre-parse before checking.
+    public func isBlocked(address: String) throws -> Bool {
+        let bare = (EntityResolver.parse(address)?.address
+                    ?? address.lowercased())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !bare.isEmpty else { return false }
+        let stmt = try conn.prepare("SELECT 1 FROM blocked_senders WHERE address = ? LIMIT 1;")
+        try stmt.bind(1, bare)
+        var found = false
+        try stmt.forEachRow { _ in found = true; return false }
+        return found
+    }
+
+    public func blockedSenders(limit: Int = 500) throws -> [BlockedSender] {
+        let stmt = try conn.prepare("""
+        SELECT address, reason, blocked_at
+          FROM blocked_senders
+         ORDER BY blocked_at DESC, address ASC
+         LIMIT ?;
+        """)
+        try stmt.bind(1, Int64(limit))
+        var out: [BlockedSender] = []
+        try stmt.forEachRow { row in
+            out.append(BlockedSender(
+                address: row.string(0) ?? "",
+                reason: row.string(1),
+                blockedAt: Date(timeIntervalSince1970: TimeInterval(row.int64(2)))
+            ))
+            return true
+        }
+        return out
+    }
+
+    /// Pure routing helper used by `runBulkInsertLoop`. If the parsed
+    /// bare address of `fromAddress` appears in `blocked`, the
+    /// destination folder becomes Spam; otherwise the caller's
+    /// folder wins. Exposed for tests.
+    static func routedFolder(
+        originalFolder: String,
+        fromAddress: String,
+        blocked: Set<String>
+    ) -> String {
+        guard !blocked.isEmpty else { return originalFolder }
+        let bare = (EntityResolver.parse(fromAddress)?.address
+                    ?? fromAddress.lowercased())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !bare.isEmpty && blocked.contains(bare) {
+            return spamFolderName
+        }
+        return originalFolder
+    }
+
+    /// Snapshot of the blocklist as a Set, used during bulkIngest so
+    /// the routing check is one O(1) lookup per message instead of a
+    /// SQL hit. Refreshed at the top of each bulk batch.
+    private func blockedAddressSet() throws -> Set<String> {
+        let stmt = try conn.prepare("SELECT address FROM blocked_senders;")
+        var out = Set<String>()
+        try stmt.forEachRow { row in
+            if let a = row.string(0) { out.insert(a) }
+            return true
+        }
+        return out
+    }
+
+    /// Move a single message to the Spam folder. Convenience over
+    /// `moveMessage` so the UI doesn't have to know the folder name.
+    public func markAsSpam(messageRowID: Int64, accountID: Int64) throws {
+        try moveMessage(messageRowID: messageRowID, accountID: accountID,
+                        toFolder: Self.spamFolderName)
+    }
+
+    /// Move a message out of Spam back into the supplied folder
+    /// (default "INBOX"). Mirror of `markAsSpam`.
+    public func markAsNotSpam(messageRowID: Int64, accountID: Int64,
+                              into folder: String = "INBOX") throws {
+        try moveMessage(messageRowID: messageRowID, accountID: accountID,
+                        toFolder: folder)
     }
 
     // MARK: - Outbox (scheduled send)

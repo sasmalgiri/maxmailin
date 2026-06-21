@@ -124,6 +124,24 @@ struct MessageListView: View {
             }
         }
         Divider()
+        if model.selectedFolder == MailStore.spamFolderName {
+            Button("Mark as not spam") {
+                Task { await model.markAsNotSpam(rowID: header.id) }
+            }
+        } else {
+            Button("Mark as spam") {
+                Task { await model.markAsSpam(rowID: header.id) }
+            }
+            if let address = EntityResolver.parse(header.fromAddress)?.address {
+                Button("Block sender \(address)") {
+                    Task {
+                        await model.blockSender(address: address,
+                                                currentRowID: header.id)
+                    }
+                }
+            }
+        }
+        Divider()
         Button("Reply") {
             Task {
                 await model.selectMessage(rowID: header.id)

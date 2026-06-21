@@ -308,6 +308,51 @@ final class MailViewModel {
         isSearching = false
     }
 
+    // MARK: - Spam / block sender
+
+    /// Move `rowID` into the Spam folder for the current account.
+    func markAsSpam(rowID: Int64) async {
+        guard let store, let acc = selectedAccount else { return }
+        do {
+            try await store.markAsSpam(messageRowID: rowID, accountID: acc.id)
+            await loadHeaders()
+            await loadFolders()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Rescue `rowID` from Spam back into the INBOX. Use this for
+    /// false positives — explicit user "this is not spam" action.
+    func markAsNotSpam(rowID: Int64) async {
+        guard let store, let acc = selectedAccount else { return }
+        do {
+            try await store.markAsNotSpam(messageRowID: rowID, accountID: acc.id)
+            await loadHeaders()
+            await loadFolders()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Block all future mail from `address` and dump the current
+    /// `rowID` into Spam in the same gesture. The two-in-one is what
+    /// a user means when they click "Block sender" — they don't want
+    /// to also have to drag the offending message manually.
+    func blockSender(address: String, currentRowID: Int64?) async {
+        guard let store, let acc = selectedAccount else { return }
+        do {
+            try await store.blockSender(address: address, reason: nil)
+            if let rowID = currentRowID {
+                try await store.markAsSpam(messageRowID: rowID, accountID: acc.id)
+            }
+            await loadHeaders()
+            await loadFolders()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     // MARK: - Snooze
 
     /// Hide `rowID` from headers queries until `until`. Caller picks
