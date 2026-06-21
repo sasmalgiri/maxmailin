@@ -116,8 +116,10 @@ struct CommandPaletteView: View {
 
     /// Single source of truth for everything ⌘K knows about. Each entry
     /// is a (title, subtitle, icon, search keywords, action) tuple.
+    /// Forensic + custody + Bates + GDPR actions all live here too so
+    /// the user never has to navigate a menu tree to do their job.
     static func commands(model: MailViewModel) -> [Command] {
-        [
+        var out: [Command] = [
             .init(id: "compose",
                   title: "Compose new message",
                   subtitle: "Write a new email",
@@ -157,7 +159,83 @@ struct CommandPaletteView: View {
                   title: "Forward current message",
                   icon: "arrowshape.turn.up.right",
                   keywords: ["fwd"],
-                  action: { model.startForward() }),
+                  action: { model.startForward() })
+        ]
+
+        // Forensic actions — one ⌘K hop, no menu hunt. Each one is
+        // gated on whether the action makes sense right now so the
+        // palette never shows dead options.
+        if model.forensic != nil {
+            if model.selectedMessageID != nil {
+                if model.currentMessageSeal == nil {
+                    out.append(.init(
+                        id: "seal",
+                        title: "Seal current message",
+                        subtitle: "Record a tamper-evident SHA-256 baseline",
+                        icon: "lock.shield",
+                        keywords: ["forensic", "evidence", "hash", "custody"],
+                        action: { Task { await model.sealCurrentMessage() } }
+                    ))
+                } else {
+                    out.append(.init(
+                        id: "verify",
+                        title: "Verify current message",
+                        subtitle: "Re-hash and compare to the sealed baseline",
+                        icon: "checkmark.seal",
+                        keywords: ["forensic", "tamper", "integrity"],
+                        action: { Task { await model.verifyCurrentMessage() } }
+                    ))
+                }
+                out.append(.init(
+                    id: "tag-evidence",
+                    title: "Tag current message as evidence",
+                    subtitle: "Records a custody event on the audit chain",
+                    icon: "tag",
+                    keywords: ["exhibit", "custody", "evidence"],
+                    action: {
+                        Task {
+                            await model.recordCustodyEvent(
+                                kind: .taggedAsEvidence,
+                                description: "Tagged via command palette"
+                            )
+                        }
+                    }
+                ))
+                out.append(.init(
+                    id: "mark-privileged",
+                    title: "Mark current message privileged",
+                    subtitle: "Counsel-only flag on the audit chain",
+                    icon: "hand.raised",
+                    keywords: ["counsel", "attorney", "privileged"],
+                    action: {
+                        Task {
+                            await model.recordCustodyEvent(
+                                kind: .markedPrivileged,
+                                description: "Marked via command palette"
+                            )
+                        }
+                    }
+                ))
+            }
+            out.append(.init(
+                id: "forensic-center",
+                title: "Open Forensic Center…",
+                subtitle: "Audit trail / Bates / GDPR",
+                icon: "shield.lefthalf.filled",
+                keywords: ["audit", "bates", "gdpr", "compliance"],
+                action: { model.showForensicCenter = true }
+            ))
+            out.append(.init(
+                id: "forensic-settings",
+                title: "Forensic settings…",
+                subtitle: "Chain secret, verify, full case bundle export",
+                icon: "lock.shield",
+                keywords: ["chain", "secret", "rotate", "case bundle"],
+                action: { model.showForensicSettings = true }
+            ))
+        }
+
+        out.append(contentsOf: [
             .init(id: "rules",
                   title: "Manage rules…",
                   subtitle: "Auto-flag, mark read, sort into folders",
@@ -197,7 +275,8 @@ struct CommandPaletteView: View {
                   icon: "sparkles",
                   keywords: ["intro", "onboarding", "guide"],
                   action: { model.showWelcome = true })
-        ]
+        ])
+        return out
     }
 
     struct Command: Identifiable {
