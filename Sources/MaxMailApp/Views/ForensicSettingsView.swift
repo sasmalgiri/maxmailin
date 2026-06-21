@@ -131,7 +131,7 @@ struct ForensicSettingsView: View {
         guard let dir = pickDirectory(prompt: "Choose case bundle location") else { return }
         isBusy = true
         defer { isBusy = false }
-        let name = "Case-\(timestamp())"
+        let name = SmartDefaults.caseBundleName()
         let bundle = dir.appendingPathComponent(name, isDirectory: true)
         do {
             try await forensic.exportFullCaseBundle(
@@ -146,11 +146,6 @@ struct ForensicSettingsView: View {
         }
     }
 
-    private func timestamp() -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd-HHmmss"
-        return f.string(from: Date())
-    }
 }
 
 private func pickDirectory(prompt: String) -> URL? {
@@ -161,6 +156,7 @@ private func pickDirectory(prompt: String) -> URL? {
     panel.allowsMultipleSelection = false
     panel.canCreateDirectories = true
     panel.prompt = prompt
+    panel.directoryURL = SmartDefaults.defaultExportDirectory()
     return panel.runModal() == .OK ? panel.url : nil
     #else
     return nil

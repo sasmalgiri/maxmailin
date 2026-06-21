@@ -186,6 +186,7 @@ struct CommandPaletteView: View {
                         action: { Task { await model.verifyCurrentMessage() } }
                     ))
                 }
+                let selectedSubject = currentSubject(model: model) ?? ""
                 out.append(.init(
                     id: "tag-evidence",
                     title: "Tag current message as evidence",
@@ -196,7 +197,10 @@ struct CommandPaletteView: View {
                         Task {
                             await model.recordCustodyEvent(
                                 kind: .taggedAsEvidence,
-                                description: "Tagged via command palette"
+                                description: SmartDefaults.custodyDescription(
+                                    kindLabel: "Tagged as evidence",
+                                    subject: selectedSubject
+                                )
                             )
                         }
                     }
@@ -211,7 +215,10 @@ struct CommandPaletteView: View {
                         Task {
                             await model.recordCustodyEvent(
                                 kind: .markedPrivileged,
-                                description: "Marked via command palette"
+                                description: SmartDefaults.custodyDescription(
+                                    kindLabel: "Marked privileged",
+                                    subject: selectedSubject
+                                )
                             )
                         }
                     }
@@ -277,6 +284,14 @@ struct CommandPaletteView: View {
                   action: { model.showWelcome = true })
         ])
         return out
+    }
+
+    /// Subject of the currently-selected message, when there is one.
+    /// Used so custody-event descriptions carry the same context the
+    /// detail-view buttons produce.
+    private static func currentSubject(model: MailViewModel) -> String? {
+        guard let id = model.selectedMessageID else { return nil }
+        return model.headers.first(where: { $0.id == id })?.subject
     }
 
     struct Command: Identifiable {

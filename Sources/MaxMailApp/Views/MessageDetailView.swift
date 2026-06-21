@@ -84,7 +84,10 @@ struct MessageDetailView: View {
                             Task {
                                 await model.recordCustodyEvent(
                                     kind: .taggedAsEvidence,
-                                    description: "Tagged from detail view"
+                                    description: SmartDefaults.custodyDescription(
+                                        kindLabel: "Tagged as evidence",
+                                        subject: selectedHeader?.subject ?? ""
+                                    )
                                 )
                             }
                         }
@@ -93,7 +96,10 @@ struct MessageDetailView: View {
                             Task {
                                 await model.recordCustodyEvent(
                                     kind: .markedPrivileged,
-                                    description: "Marked privileged from detail view"
+                                    description: SmartDefaults.custodyDescription(
+                                        kindLabel: "Marked privileged",
+                                        subject: selectedHeader?.subject ?? ""
+                                    )
                                 )
                             }
                         }
@@ -102,7 +108,10 @@ struct MessageDetailView: View {
                             Task {
                                 await model.recordCustodyEvent(
                                     kind: .accessed,
-                                    description: "Opened in review"
+                                    description: SmartDefaults.custodyDescription(
+                                        kindLabel: "Opened in review",
+                                        subject: selectedHeader?.subject ?? ""
+                                    )
                                 )
                             }
                         }

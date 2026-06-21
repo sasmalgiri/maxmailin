@@ -309,7 +309,7 @@ private struct BatesTab: View {
         defer { isBusy = false }
         do {
             let bundle = dir.appendingPathComponent(
-                "BatesIndex-\(bundleTimestamp())", isDirectory: true
+                SmartDefaults.batesBundleName(), isDirectory: true
             )
             _ = try await forensic.bates.exportBatesIndex(
                 actor: model.selectedAccount?.address ?? "examiner",
@@ -326,9 +326,7 @@ private struct BatesTab: View {
 }
 
 private func bundleTimestamp() -> String {
-    let f = DateFormatter()
-    f.dateFormat = "yyyyMMdd-HHmmss"
-    return f.string(from: Date())
+    SmartDefaults.timestamp()
 }
 
 // MARK: - GDPR
@@ -343,6 +341,18 @@ private struct GDPRTab: View {
     @State private var isBusy = false
     @State private var showEraseConfirm = false
     @State private var eraseReason: String = ""
+
+    /// Best guess at the data subject before the user types anything.
+    /// Uses the from-address of the currently-selected message when
+    /// available — the most common workflow is "this guy mailed me,
+    /// run a GDPR report on him" so opening the tab with the address
+    /// already filled in saves a step.
+    private var suggestedSubject: String {
+        guard let id = model.selectedMessageID,
+              let header = model.headers.first(where: { $0.id == id })
+        else { return "" }
+        return EntityResolver.parse(header.fromAddress)?.address ?? ""
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -366,6 +376,14 @@ private struct GDPRTab: View {
                     }
                 }
                 .disabled(subject.isEmpty || isBusy)
+            }
+            .task(id: model.selectedMessageID) {
+                // Pre-fill from the selected message when this tab
+                // opens or selection changes — never clobber a value
+                // the user typed.
+                if subject.isEmpty {
+                    subject = suggestedSubject
+                }
             }
 
             if let r = report {
@@ -406,6 +424,15 @@ private struct GDPRTab: View {
             }
         } message: {
             Text("This permanently deletes every message involving the subject. The rationale is written to the audit chain BEFORE deletion so the record survives the cascade.")
+        }
+        .onChange(of: showEraseConfirm) { _, opened in
+            // Each time the destructive sheet opens, refresh the
+            // suggested rationale with today's date — but never
+            // overwrite a value the user has already typed since
+            // the last successful erase.
+            if opened, eraseReason.isEmpty {
+                eraseReason = SmartDefaults.eraseReason(for: subject)
+            }
         }
     }
 
@@ -471,7 +498,7 @@ private struct GDPRTab: View {
         defer { isBusy = false }
         do {
             let bundle = dir.appendingPathComponent(
-                "GDPR-\(safe(subject))-\(bundleTimestamp())",
+                SmartDefaults.gdprBundleName(subject: subject),
                 isDirectory: true
             )
             _ = try await forensic.gdpr.exportBundle(
@@ -508,16 +535,13 @@ private struct GDPRTab: View {
         }
     }
 
-    private func safe(_ s: String) -> String {
-        s.replacingOccurrences(of: "@", with: "_at_")
-            .replacingOccurrences(of: "/", with: "_")
-    }
 }
 
 // MARK: - Directory picker
 
-/// Mac directory picker. Returns nil on cancel. UIKit fallback isn't
-/// wired yet — Forensic Center is Mac-only in this slice.
+/// Mac directory picker, landing in `~/Documents/maxmailin/` by default
+/// so the user can confirm with one click instead of navigating. UIKit
+/// fallback isn't wired yet — Forensic Center is Mac-only in this slice.
 private func pickDirectory(prompt: String) -> URL? {
     #if canImport(AppKit)
     let panel = NSOpenPanel()
@@ -526,6 +550,7 @@ private func pickDirectory(prompt: String) -> URL? {
     panel.allowsMultipleSelection = false
     panel.canCreateDirectories = true
     panel.prompt = prompt
+    panel.directoryURL = SmartDefaults.defaultExportDirectory()
     return panel.runModal() == .OK ? panel.url : nil
     #else
     return nil
