@@ -243,6 +243,12 @@ struct CommandPaletteView: View {
         }
 
         out.append(contentsOf: [
+            .init(id: "add-account",
+                  title: "Add account…",
+                  subtitle: "Type your email — Gmail / iCloud / Outlook auto-detected",
+                  icon: "envelope.badge.shield.half.filled",
+                  keywords: ["new account", "gmail", "icloud", "outlook", "fastmail", "yahoo", "setup", "connect"],
+                  action: { model.showAddAccount = true }),
             .init(id: "rules",
                   title: "Manage rules…",
                   subtitle: "Auto-flag, mark read, sort into folders",

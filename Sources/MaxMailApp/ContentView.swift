@@ -88,6 +88,8 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Menu {
+                    Button("Add account…")    { model.showAddAccount = true }
+                    Divider()
                     Button("JMAP settings…")  { model.showJMAPSettings = true }
                     Button("IMAP settings…")  { model.showIMAPSettings = true }
                     Divider()
@@ -136,6 +138,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $bindable.showForensicSettings) {
             ForensicSettingsView().environment(model)
+        }
+        .sheet(isPresented: $bindable.showAddAccount) {
+            AddAccountView().environment(model)
         }
         .overlay {
             if model.isLocked {
