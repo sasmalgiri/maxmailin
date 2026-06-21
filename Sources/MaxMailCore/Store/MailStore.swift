@@ -980,6 +980,89 @@ public actor MailStore {
     /// Pull the RFC 5322 Message-ID + the parsed references chain for one
     /// message. Used by Reply / Forward to set threading headers on the new
     /// outbound message so the conversation stitches together server-side.
+    /// Like `headers(...)`, but also returns each row's threading
+    /// fields (message_id, in_reply_to, references) in one SQL pass.
+    /// The ThreadGrouper runs over this projection. Pulled separately
+    /// from the headers API because most callers don't need the cost
+    /// of carrying references strings around.
+    public struct ThreadableHeader: Sendable {
+        public let header: MessageHeader
+        public let messageID: String
+        public let inReplyTo: String?
+        public let references: [String]
+        public init(header: MessageHeader, messageID: String,
+                    inReplyTo: String?, references: [String]) {
+            self.header = header
+            self.messageID = messageID
+            self.inReplyTo = inReplyTo
+            self.references = references
+        }
+    }
+
+    public func threadableHeaders(
+        in folder: String, accountID: Int64,
+        before: Date? = nil, limit: Int = 200
+    ) throws -> [ThreadableHeader] {
+        let sql: String
+        if before == nil {
+            sql = """
+            SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+                   m.size_bytes, m.flags, m.snippet,
+                   m.in_reply_to, m.references_
+              FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE f.account_id = ? AND f.path = ?
+             ORDER BY m.date_unix DESC, m.id DESC
+             LIMIT ?;
+            """
+        } else {
+            sql = """
+            SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+                   m.size_bytes, m.flags, m.snippet,
+                   m.in_reply_to, m.references_
+              FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE f.account_id = ? AND f.path = ? AND m.date_unix < ?
+             ORDER BY m.date_unix DESC, m.id DESC
+             LIMIT ?;
+            """
+        }
+        let stmt = try conn.prepare(sql)
+        try stmt.bind(1, accountID)
+        try stmt.bind(2, folder)
+        if let before {
+            try stmt.bind(3, Int64(before.timeIntervalSince1970))
+            try stmt.bind(4, Int64(limit))
+        } else {
+            try stmt.bind(3, Int64(limit))
+        }
+        var out: [ThreadableHeader] = []
+        out.reserveCapacity(limit)
+        try stmt.forEachRow { row in
+            let header = MessageHeader(
+                id: row.int64(0),
+                messageID: row.string(1) ?? "",
+                folder: row.string(2) ?? "",
+                subject: row.string(3) ?? "",
+                fromAddress: row.string(4) ?? "",
+                date: Date(timeIntervalSince1970: TimeInterval(row.int64(5))),
+                sizeBytes: row.int64(6),
+                flags: MessageFlags(rawValue: row.int(7)),
+                snippet: row.string(8)
+            )
+            let refs = (row.string(10) ?? "")
+                .split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { !$0.isEmpty }
+            out.append(ThreadableHeader(
+                header: header,
+                messageID: row.string(1) ?? "",
+                inReplyTo: row.string(9),
+                references: refs
+            ))
+            return true
+        }
+        return out
+    }
+
     public func messageThreading(rowID: Int64) throws -> (messageID: String, references: [String])? {
         let stmt = try conn.prepare("""
         SELECT message_id, references_ FROM messages WHERE id = ?;

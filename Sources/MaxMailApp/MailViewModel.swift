@@ -30,6 +30,15 @@ final class MailViewModel {
     var selectedFolder: String?
 
     var headers: [MessageHeader] = []
+    /// Thread groupings for the current `headers` page. Built lazily —
+    /// only present after a `loadHeadersWithThreading()` call. Empty
+    /// when threading is off, when there's nothing to render, or
+    /// when the user is viewing a search result.
+    var threads: [MailThread] = []
+    var groupByThread: Bool = true
+    /// Thread root → expanded? When false the list shows only the
+    /// thread row; when true it shows every message in the chain.
+    var expandedThreads: Set<String> = []
     var selectedMessageID: Int64?
 
     var currentBody: (plain: String?, html: String?)?
@@ -177,12 +186,39 @@ final class MailViewModel {
         guard let store,
               let acc = selectedAccount,
               let folder = selectedFolder else {
-            headers = []; return
+            headers = []; threads = []; return
         }
         do {
-            headers = try await store.headers(in: folder, accountID: acc.id, limit: 200)
+            if groupByThread {
+                let rows = try await store.threadableHeaders(
+                    in: folder, accountID: acc.id, limit: 200
+                )
+                headers = rows.map(\.header)
+                threads = ThreadGrouper.group(rows)
+            } else {
+                headers = try await store.headers(in: folder, accountID: acc.id, limit: 200)
+                threads = []
+            }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Flip threaded ↔ flat. Reloads the current page so the list view
+    /// switches over in one tick. The previously expanded set is kept
+    /// so going threaded → flat → threaded leaves the user's open
+    /// chains intact.
+    func setGroupByThread(_ on: Bool) async {
+        groupByThread = on
+        await loadHeaders()
+    }
+
+    /// Toggle a thread's expanded/collapsed state by its root id.
+    func toggleThread(rootID: String) {
+        if expandedThreads.contains(rootID) {
+            expandedThreads.remove(rootID)
+        } else {
+            expandedThreads.insert(rootID)
         }
     }
 
