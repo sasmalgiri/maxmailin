@@ -68,6 +68,7 @@ struct MessageDetailView: View {
                     } label: {
                         Label("Seal", systemImage: "lock.shield")
                     }
+                    .keyboardShortcut("e", modifiers: [.command])
                     .disabled(model.isCustodyBusy || model.currentMessageSeal != nil)
 
                     Button {
@@ -75,6 +76,7 @@ struct MessageDetailView: View {
                     } label: {
                         Label("Verify", systemImage: "checkmark.seal")
                     }
+                    .keyboardShortcut("e", modifiers: [.shift, .command])
                     .disabled(model.isCustodyBusy || model.currentMessageSeal == nil)
 
                     Menu {
@@ -86,6 +88,7 @@ struct MessageDetailView: View {
                                 )
                             }
                         }
+                        .keyboardShortcut("t", modifiers: [.command])
                         Button("Mark Privileged") {
                             Task {
                                 await model.recordCustodyEvent(
@@ -94,6 +97,7 @@ struct MessageDetailView: View {
                                 )
                             }
                         }
+                        .keyboardShortcut("t", modifiers: [.shift, .command])
                         Button("Record Access") {
                             Task {
                                 await model.recordCustodyEvent(
@@ -147,16 +151,19 @@ struct MessageDetailView: View {
             } label: {
                 Label("Reply", systemImage: "arrowshape.turn.up.left")
             }
+            .keyboardShortcut("r", modifiers: [.shift, .command])
             Button {
                 model.startReply(replyAll: true)
             } label: {
                 Label("Reply All", systemImage: "arrowshape.turn.up.left.2")
             }
+            .keyboardShortcut("r", modifiers: [.option, .command])
             Button {
                 model.startForward()
             } label: {
                 Label("Forward", systemImage: "arrowshape.turn.up.right")
             }
+            .keyboardShortcut("f", modifiers: [.shift, .command])
             Spacer()
         }
         .buttonStyle(.bordered)

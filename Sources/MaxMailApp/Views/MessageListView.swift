@@ -50,6 +50,18 @@ struct MessageListView: View {
         .listStyle(.inset)
         .navigationTitle(model.selectedFolder ?? "")
         .navigationSubtitle("\(model.headers.count) shown")
+        // Vim-style next / previous message. Only fires when the list
+        // itself is the keyboard responder (i.e., when the user is not
+        // typing in the search bar or compose), so J/K still work as
+        // text input in those contexts.
+        .onKeyPress(.init("j")) {
+            Task { await model.moveSelection(by: 1) }
+            return .handled
+        }
+        .onKeyPress(.init("k")) {
+            Task { await model.moveSelection(by: -1) }
+            return .handled
+        }
         .overlay {
             if model.headers.isEmpty {
                 ContentUnavailableView(

@@ -186,6 +186,26 @@ final class MailViewModel {
         }
     }
 
+    /// Move selection by `offset` rows in the current message list
+    /// (positive = down, negative = up). Used by J/K keyboard nav so
+    /// the user can blaze through a folder without touching the mouse.
+    /// No-op when the list is empty or the offset would land outside
+    /// the visible range — caller can spam J past the end without
+    /// causing wraparound or selection jumps.
+    func moveSelection(by offset: Int) async {
+        guard !headers.isEmpty else { return }
+        let currentIndex: Int
+        if let id = selectedMessageID,
+           let i = headers.firstIndex(where: { $0.id == id }) {
+            currentIndex = i
+        } else {
+            currentIndex = offset >= 0 ? -1 : headers.count
+        }
+        let target = currentIndex + offset
+        guard target >= 0, target < headers.count else { return }
+        await selectMessage(rowID: headers[target].id)
+    }
+
     func selectMessage(rowID: Int64) async {
         selectedMessageID = rowID
         currentNLP = nil
