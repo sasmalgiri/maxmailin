@@ -6,6 +6,16 @@ struct AccountSummary: Identifiable, Hashable {
     let id: Int64
     let name: String
     let address: String
+
+    /// Sentinel ID for the virtual "All Inboxes" entry that merges
+    /// every configured account's INBOX. Sidebar always renders it
+    /// first; loadHeaders branches to the unified store query when
+    /// this is the selected account.
+    static let allInboxesID: Int64 = -1
+    static let allInboxes = AccountSummary(
+        id: allInboxesID, name: "All Inboxes", address: ""
+    )
+    var isUnified: Bool { id == Self.allInboxesID }
 }
 
 struct FolderSummary: Identifiable, Hashable {
@@ -161,8 +171,16 @@ final class MailViewModel {
         guard let store else { return }
         do {
             let raw = try await store.accountsList()
-            self.accounts = raw.map { AccountSummary(id: $0.id, name: $0.name, address: $0.address) }
-            if selectedAccount == nil { selectedAccount = accounts.first }
+            var all = raw.map { AccountSummary(id: $0.id, name: $0.name, address: $0.address) }
+            // Prepend the virtual "All Inboxes" entry whenever there
+            // are two or more real accounts. With a single account the
+            // unified view collapses to the same content, so the
+            // entry would just be noise.
+            if all.count >= 2 {
+                all.insert(.allInboxes, at: 0)
+            }
+            self.accounts = all
+            if selectedAccount == nil { selectedAccount = all.first }
             await loadFolders()
         } catch {
             errorMessage = error.localizedDescription
@@ -172,6 +190,21 @@ final class MailViewModel {
     func loadFolders() async {
         guard let store, let acc = selectedAccount else {
             folders = []; selectedFolder = nil
+            return
+        }
+        if acc.isUnified {
+            // Unified view only exposes INBOX — the only folder that
+            // semantically merges across accounts (Sent / Drafts /
+            // Spam are account-local). Counts are aggregated.
+            do {
+                let counts = try await store.unifiedFolderCounts(folder: "INBOX")
+                folders = [FolderSummary(path: "INBOX",
+                                         count: counts.total,
+                                         unread: counts.unread)]
+                if selectedFolder != "INBOX" { selectedFolder = "INBOX" }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
             return
         }
         do {
@@ -197,6 +230,20 @@ final class MailViewModel {
             headers = []; threads = []; return
         }
         do {
+            if acc.isUnified {
+                if groupByThread {
+                    let rows = try await store.unifiedThreadableHeaders(
+                        in: folder, limit: 200
+                    )
+                    headers = rows.map(\.header)
+                    threads = ThreadGrouper.group(rows)
+                } else {
+                    headers = try await store.unifiedHeaders(in: folder, limit: 200)
+                    threads = []
+                }
+                statusMessage = "Ready"
+                return
+            }
             if groupByThread {
                 let rows = try await store.threadableHeaders(
                     in: folder, accountID: acc.id, limit: 200
@@ -210,6 +257,19 @@ final class MailViewModel {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Switch the selected account (real or the virtual All-Inboxes
+    /// entry) and reload folders + headers. No-op if `acc` is the
+    /// already-selected account.
+    func selectAccount(_ acc: AccountSummary) async {
+        guard selectedAccount?.id != acc.id else { return }
+        selectedAccount = acc
+        // Reset folder so loadFolders() picks the right one — for the
+        // unified entry that's INBOX, otherwise the account's first.
+        selectedFolder = nil
+        await loadFolders()
+        await loadHeaders()
     }
 
     /// Flip threaded ↔ flat. Reloads the current page so the list view

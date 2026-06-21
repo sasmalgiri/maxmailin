@@ -1142,6 +1142,168 @@ public actor MailStore {
         return out
     }
 
+    // MARK: - Unified inbox (all accounts)
+
+    /// Same shape as `headers(in:accountID:...)` but doesn't filter by
+    /// account — returns the latest messages from `folder` across
+    /// every configured account, merged date-descending. Used by the
+    /// "All Inboxes" sidebar entry so the user gets one stream to
+    /// triage instead of switching between accounts.
+    ///
+    /// Snooze filter still applies; the keyset pagination shape
+    /// matches `headers` so the same UI loop can drive both.
+    public func unifiedHeaders(
+        in folder: String = "INBOX", before: Date? = nil, limit: Int = 200
+    ) throws -> [MessageHeader] {
+        let now = Int64(Date().timeIntervalSince1970)
+        let sql: String
+        if before == nil {
+            sql = """
+            SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+                   m.size_bytes, m.flags, m.snippet
+              FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
+             WHERE f.path = ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
+             ORDER BY m.date_unix DESC, m.id DESC
+             LIMIT ?;
+            """
+        } else {
+            sql = """
+            SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+                   m.size_bytes, m.flags, m.snippet
+              FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
+             WHERE f.path = ? AND m.date_unix < ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
+             ORDER BY m.date_unix DESC, m.id DESC
+             LIMIT ?;
+            """
+        }
+        let stmt = try conn.prepare(sql)
+        try stmt.bind(1, folder)
+        if let before {
+            try stmt.bind(2, Int64(before.timeIntervalSince1970))
+            try stmt.bind(3, now)
+            try stmt.bind(4, Int64(limit))
+        } else {
+            try stmt.bind(2, now)
+            try stmt.bind(3, Int64(limit))
+        }
+        var out: [MessageHeader] = []
+        out.reserveCapacity(limit)
+        try stmt.forEachRow { row in
+            out.append(MessageHeader(
+                id: row.int64(0),
+                messageID: row.string(1) ?? "",
+                folder: row.string(2) ?? "",
+                subject: row.string(3) ?? "",
+                fromAddress: row.string(4) ?? "",
+                date: Date(timeIntervalSince1970: TimeInterval(row.int64(5))),
+                sizeBytes: row.int64(6),
+                flags: MessageFlags(rawValue: row.int(7)),
+                snippet: row.string(8)
+            ))
+            return true
+        }
+        return out
+    }
+
+    /// Threading-aware sibling of `unifiedHeaders`. The ThreadGrouper
+    /// runs over the cross-account result so a reply to alice@gmail
+    /// sent from alice@fastmail still clusters with the root.
+    public func unifiedThreadableHeaders(
+        in folder: String = "INBOX", before: Date? = nil, limit: Int = 200
+    ) throws -> [ThreadableHeader] {
+        let now = Int64(Date().timeIntervalSince1970)
+        let sql: String
+        if before == nil {
+            sql = """
+            SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+                   m.size_bytes, m.flags, m.snippet,
+                   m.in_reply_to, m.references_
+              FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
+             WHERE f.path = ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
+             ORDER BY m.date_unix DESC, m.id DESC
+             LIMIT ?;
+            """
+        } else {
+            sql = """
+            SELECT m.id, m.message_id, f.path, m.subject, m.from_addr, m.date_unix,
+                   m.size_bytes, m.flags, m.snippet,
+                   m.in_reply_to, m.references_
+              FROM messages m JOIN folders f ON f.id = m.folder_id
+              LEFT JOIN snoozed_messages s ON s.message_id = m.id
+             WHERE f.path = ? AND m.date_unix < ?
+               AND (s.snoozed_until IS NULL OR s.snoozed_until <= ?)
+             ORDER BY m.date_unix DESC, m.id DESC
+             LIMIT ?;
+            """
+        }
+        let stmt = try conn.prepare(sql)
+        try stmt.bind(1, folder)
+        if let before {
+            try stmt.bind(2, Int64(before.timeIntervalSince1970))
+            try stmt.bind(3, now)
+            try stmt.bind(4, Int64(limit))
+        } else {
+            try stmt.bind(2, now)
+            try stmt.bind(3, Int64(limit))
+        }
+        var out: [ThreadableHeader] = []
+        out.reserveCapacity(limit)
+        try stmt.forEachRow { row in
+            let header = MessageHeader(
+                id: row.int64(0),
+                messageID: row.string(1) ?? "",
+                folder: row.string(2) ?? "",
+                subject: row.string(3) ?? "",
+                fromAddress: row.string(4) ?? "",
+                date: Date(timeIntervalSince1970: TimeInterval(row.int64(5))),
+                sizeBytes: row.int64(6),
+                flags: MessageFlags(rawValue: row.int(7)),
+                snippet: row.string(8)
+            )
+            let refs = (row.string(10) ?? "")
+                .split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { !$0.isEmpty }
+            out.append(ThreadableHeader(
+                header: header,
+                messageID: row.string(1) ?? "",
+                inReplyTo: row.string(9),
+                references: refs
+            ))
+            return true
+        }
+        return out
+    }
+
+    /// Unread counts per account for `folder`. Powers the "All
+    /// Inboxes" sidebar badge that aggregates every account's
+    /// unread mail without forcing the UI to roll its own SQL.
+    public func unifiedFolderCounts(folder: String = "INBOX")
+        throws -> (total: Int64, unread: Int64)
+    {
+        let stmt = try conn.prepare("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END)
+          FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE f.path = ?;
+        """)
+        try stmt.bind(1, folder)
+        var total: Int64 = 0
+        var unread: Int64 = 0
+        try stmt.forEachRow { row in
+            total = row.int64(0)
+            unread = row.isNull(1) ? 0 : row.int64(1)
+            return false
+        }
+        return (total, unread)
+    }
+
     public func messageThreading(rowID: Int64) throws -> (messageID: String, references: [String])? {
         let stmt = try conn.prepare("""
         SELECT message_id, references_ FROM messages WHERE id = ?;
