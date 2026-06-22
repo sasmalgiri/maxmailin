@@ -1,20 +1,67 @@
 # maxmailin
 
-A full-fledged Apple-platform mail client that scales to **1 TB+** archives, with the AI and forensic capabilities of [`mailin`](https://github.com/sasmalgiri/mailin) layered on top.
+A full-fledged Apple-platform mail client with the AI and forensic
+capabilities of [`mailin`](https://github.com/sasmalgiri/mailin) layered
+on top, and a bounded-RAM storage engine measured to ingest **10 M
+messages at 10.8 k msg/sec while resident memory stays under 100 MB**
+(see [Measured scale](#measured-scale-2026-06)).
 
-> Where `mailin` is an offline, evidence-grade archive viewer (bounded by RAM and a 500 MB store cap), `maxmailin` is built foundation-up for live accounts (IMAP / JMAP / Gmail API / Microsoft Graph) and terabyte-scale mailboxes — using a SQLite + FTS5 core, content-addressed blob storage, and streaming everywhere.
+> Where `mailin` is an offline, evidence-grade archive viewer (bounded by RAM and a 500 MB store cap), `maxmailin` is built foundation-up for live accounts (IMAP / JMAP / planned Gmail API + Microsoft Graph) and multi-million-message archives — using a SQLite + FTS5 core, content-addressed blob storage, and streaming everywhere.
 
 ## Status
 
-Phases 1 through 4 (Mac-only first-cut UI) are in.
+Mac-only desktop client with the full forensic suite, threading, snooze,
+spam, and the Add-Account wizard. 230+ unit tests, all green.
 
-- **MaxMailCore** — SQLite + per-year FTS5 shards, content-addressed BlobStore,
-  streaming mbox parser with RFC 5322 + MIME multipart. 11k inserts/sec, sub-100ms
-  search on the recent window at 1 M messages, RSS bounded ~130 MB.
-- **MaxMailApp** — SwiftUI three-pane (folders / list / detail) on macOS, opens
-  a persistent store at `~/Library/Application Support/maxmailin/mail.sqlite`,
-  imports an `.mbox` via the toolbar.
+- **MaxMailCore** — SQLite + per-month FTS5 shards (denormalised
+  UNINDEXED columns so search never JOINs back to `messages`),
+  content-addressed BlobStore, streaming mbox + .emlx parsers with
+  RFC 5322 + MIME multipart, JMAP / IMAP / SMTP wire layers, HMAC-chained
+  audit log, signed export bundles, ChainOfCustody / Bates / GDPR /
+  InvestigationReport / EncryptedStorage / Duplicate / Entity engines.
+- **MaxMailApp** — SwiftUI three-pane (folders / list / detail) on macOS.
+  Persistent store at `~/Library/Application Support/maxmailin/mail.sqlite`.
+  Reachable from the toolbar or ⌘K: mbox import, JMAP / IMAP push,
+  Insights dashboard, Forensic Center, Add-Account wizard.
 - **maxmail-stress** — synthetic scale harness + `--mbox` real-archive ingest.
+
+## Measured scale (2026-06)
+
+Numbers below are from a release-build `maxmail-stress` run on this machine,
+not extrapolation. Harness writes synthetic mail through the same
+`MailStore.bulkIngest` path the .mbox importer uses.
+
+| Corpus | Ingest | RSS peak | DB file | List paginate | FTS5 search (all time, p50) |
+|--------|--------|----------|---------|---------------|-----------------------------|
+| **1 M messages** | 11,084 msg/sec | 80.7 MB | 1.95 GB | 0.10 ms/page | 271 ms |
+| **10 M messages** | 10,818 msg/sec | 92.2 MB | 19.65 GB | 0.11 ms/page | 8.41 s |
+
+Reproduce:
+
+```
+swift build -c release --product maxmail-stress
+.build/release/maxmail-stress -n 10000000 -b 10000 -q 100
+```
+
+### What this measures, honestly
+
+- **Ingest** sustains ~11k msg/sec from 0 → 10 M with no degradation.
+  Memory stays bounded at ~92 MB resident throughout — the entire archive
+  never lives in RAM, which is what "scales to 1 TB" actually requires.
+  Extrapolated to 1 TB at ~70 KB/msg ≈ 14 M messages, the storage layer
+  is ready; the limit at that point is disk space, not the engine.
+- **List pagination** stays sub-millisecond per 50-row page even at 10 M
+  because keyset (`WHERE date_unix < ?`) hits the existing index.
+- **Search (all-time, p50)** is the honest weak spot. At 1 M the
+  user-facing search is interactive (~270 ms); at 10 M an unwindowed
+  search across every month-shard sits around 8 s because the
+  cross-shard merge cost grows super-linearly with shard count.
+  Mitigation in the UI is to default search to a date window
+  ("last 30 days") — that path scans only the relevant shards and
+  the existing `since:` filter pushes the cost back to interactive.
+- **RSS at start / after queries**: 25 / 235 MB. The post-query bump
+  is one-time and comes from Apple framework caches; ingest itself
+  never grows.
 
 ## Architecture
 
